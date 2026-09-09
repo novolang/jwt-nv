@@ -1,0 +1,304 @@
+// jwttoken_tests.nv — the API suite for the two token types, which are
+// this package's load-bearing interface.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// jwt-nv.jwttoken.<fn>`.
+//
+// THE THING THIS SUITE PROVES BEFORE ANY BODY EXISTS is not in an
+// assertion at all — it is in what the file DOES NOT CONTAIN.  There
+// is no line here that reads claims out of an `UnverifiedJwt`, because
+// no such line compiles: `claims_of` takes a `VerifiedJwt`, only
+// `verify` produces one, and the type checker settles it.  A reader
+// wanting to confirm that tries to write the line and finds out.
+
+use std.test
+use jwtalg
+use jwtclaims
+use jwtpolicy
+use jwterror
+use jwttoken
+
+// A 32-byte HS256 secret, which is the shortest RFC 7518 § 3.2 allows.
+fn secret() -> Bytes
+    bytes.from_str("a-32-byte-secret-for-hs256-here!")
+
+// A policy that accepts HS256 from one issuer for one audience.
+fn policy() -> JwtPolicy
+    jwtpolicy.requiring(
+        jwtpolicy.allowing(jwtpolicy.strict(), [Hs256]),
+        "https://auth.example", "api")
+
+// A fixed instant, so these cases never depend on a clock.  The
+// package is `core` and cannot read one; that is the design, and it is
+// also what makes this suite deterministic.
+fn now() -> JwtInstant
+    jwtclaims.instant(1700000000)
+
+// A token issued at `now()`, good for an hour, from the fixtures
+// above.  The empty string stands in when signing fails, so the
+// assertion below reports itself.
+fn a_token() -> Str
+    let c = jwtclaims.with_exp(
+        jwtclaims.with_aud(
+            jwtclaims.with_iss(jwtclaims.claims(), "https://auth.example"),
+            ["api"]),
+        jwtclaims.plus(now(), 3600))
+    match jwttoken.encode(jwtclaims.header(Hs256), c, jwtalg.hmac_key(secret()))
+        Ok(s)  => s
+        Err(_) => ""
+
+@test
+fn test_claims_can_only_be_reached_through_a_verified_token() [io]
+    // THE LOAD-BEARING PROPERTY.  `decode` gives an `UnverifiedJwt`
+    // and there is no function anywhere that takes one and returns
+    // `JwtClaims` — so the shortest path from a string to a `sub` goes
+    // through a signature check, and a reviewer never has to ask
+    // whether one happened.
+    test.case("decode produces an UNVERIFIED token")
+    match jwttoken.decode(a_token())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and verify is the only way to get one whose claims can be read")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  policy(), now())
+                Ok(v)  => test.assert(jwttoken.claims_of(v).iss == "https://auth.example")
+                Err(_) => test.fail("the fixture verifies under its own policy")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+@test
+fn test_the_none_algorithm_is_unrepresentable() [io]
+    // The most famous JWT vulnerability, closed by the TYPE and not by
+    // a check a refactor could delete: `JwtAlg` has three arms and
+    // none of them is `none`, so no value means "unsigned".
+    test.case("`none` names no algorithm, in any spelling")
+    match jwtalg.alg_named("none")
+        Some(_) => test.fail("there is no JwtAlg arm for `none`")
+        None    => test.assert(true)
+    match jwtalg.alg_named("None")
+        Some(_) => test.fail("nor for any other spelling of it")
+        None    => test.assert(true)
+
+    test.case("so a token whose header says `none` fails at the decode")
+    // {"alg":"none"} . {} . (empty signature) — the classic forgery.
+    match jwttoken.decode("eyJhbGciOiJub25lIn0.e30.")
+        Err(UnknownAlgorithm(n)) => test.assert(n == "none")
+        Err(_)                   => test.fail("wrong reason for `alg: none`")
+        Ok(_)                    => test.fail("a `none` token is never decodable")
+
+    test.case("and so does an algorithm this package has not implemented")
+    match jwtalg.alg_named("HS512")
+        Some(_) => test.fail("HS512 is not implemented, and says so")
+        None    => test.assert(true)
+
+@test
+fn test_the_key_decides_the_algorithm_and_never_the_header() [io]
+    // Algorithm confusion: a token signed HS256 using the RSA PUBLIC
+    // key as the HMAC secret, accepted by a verifier that read the
+    // algorithm out of the token's own header.  `verify` compares the
+    // header against the KEY's algorithm and refuses a mismatch.
+    test.case("an HS256 token against an RS256 key is AlgorithmMismatch")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            let rsa = jwtalg.rsa_verifying_key(bytes.from_str("<der>"))
+            match jwttoken.verify(t, rsa, jwtpolicy.permissive(), now())
+                Err(AlgorithmMismatch(h, k)) =>
+                    test.assert(h == "HS256")
+                    test.assert(k == "RS256")
+                Err(_)                       => test.fail("wrong reason for an algorithm mismatch")
+                Ok(_)                        => test.fail("the header and the key disagree")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and the header's alg is a routing hint the caller may read")
+    match jwttoken.decode(a_token())
+        Ok(t)  => test.assert(jwtalg.alg_name(jwttoken.alg_of(t)) == "HS256")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+@test
+fn test_a_bad_signature_is_refused_before_the_payload_is_parsed() [io]
+    // The claims are parsed after the signature check and never
+    // before, so a malformed payload behind a bad signature never
+    // reaches the JSON decoder.
+    test.case("a token signed with a different secret is BadSignature")
+    let other = bytes.from_str("a-DIFFERENT-32-byte-secret-here!")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(other),
+                                  policy(), now())
+                Err(BadSignature) => test.assert(true)
+                Err(_)            => test.fail("wrong reason for a forged signature")
+                Ok(_)             => test.fail("a different secret must not verify")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and the reason is NOT one to repeat to a client")
+    test.assert(not jwterror.is_client_safe(BadSignature))
+
+@test
+fn test_the_policy_is_checked_in_the_order_the_docs_state() [io]
+    test.case("an algorithm outside the policy's list is refused")
+    let rs_only = jwtpolicy.requiring(
+        jwtpolicy.allowing(jwtpolicy.strict(), [Rs256]),
+        "https://auth.example", "api")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  rs_only, now())
+                Err(AlgorithmNotAllowed(a)) => test.assert(a == "HS256")
+                Err(_)                      => test.fail("wrong reason for a retired algorithm")
+                Ok(_)                       => test.fail("the policy does not allow HS256")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("a wrong issuer is refused, and is not client-safe")
+    let elsewhere = jwtpolicy.requiring(
+        jwtpolicy.allowing(jwtpolicy.strict(), [Hs256]),
+        "https://other.example", "api")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  elsewhere, now())
+                Err(WrongIssuer(want, got)) =>
+                    test.assert(want == "https://other.example")
+                    test.assert(got == "https://auth.example")
+                Err(_)                      => test.fail("wrong reason for a foreign issuer")
+                Ok(_)                       => test.fail("the issuer does not match")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("a wrong audience is refused, and IS client-safe")
+    let other_aud = jwtpolicy.requiring(
+        jwtpolicy.allowing(jwtpolicy.strict(), [Hs256]),
+        "https://auth.example", "admin")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  other_aud, now())
+                Err(WrongAudience(want)) =>
+                    test.assert(want == "admin")
+                    test.assert(jwterror.is_client_safe(WrongAudience("admin")))
+                Err(_)                   => test.fail("wrong reason for a foreign audience")
+                Ok(_)                    => test.fail("the token is for `api`, not `admin`")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+@test
+fn test_the_instant_is_a_parameter_so_a_test_needs_no_fake_clock() [io]
+    // This package is `core` and may not read a clock, so `now`
+    // arrives as an argument — and the by-product is that this suite
+    // can verify at any instant it likes, and an audit tool can ask
+    // "was this valid when it was presented" rather than only "is it
+    // valid now".
+    test.case("the fixture verifies an hour before it expires")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  policy(), now())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.fail("the token is good for an hour")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and is Expired two hours later, carrying both times")
+    let later = jwtclaims.plus(now(), 7200)
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  policy(), later)
+                Err(Expired(at, seen)) =>
+                    test.assert(at == 1700003600)
+                    test.assert(seen == 1700007200)
+                Err(_)                 => test.fail("wrong reason for an expired token")
+                Ok(_)                  => test.fail("the token expired an hour before `later`")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("expiry IS client-safe — it is what triggers a refresh")
+    test.assert(jwterror.is_client_safe(Expired(1700003600, 1700007200)))
+
+@test
+fn test_leeway_covers_clock_skew_and_is_the_callers_number() [io]
+    let just_after = jwtclaims.plus(now(), 3630)
+
+    test.case("thirty seconds past expiry, with no leeway, is refused")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  policy(), just_after)
+                Err(Expired(_, _)) => test.assert(true)
+                Err(_)             => test.fail("wrong reason")
+                Ok(_)              => test.fail("strict() allows no skew")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and accepted with sixty seconds of it, which the caller named")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                  jwtpolicy.with_leeway(policy(), 60), just_after)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.fail("thirty seconds is inside sixty of leeway")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+@test
+fn test_the_escape_hatch_returns_text_and_not_claims() [io]
+    // It exists because introspection tools and migrations need it,
+    // and refusing outright would send them to a hand-rolled base64
+    // split with no `crit` check and no name a reviewer would notice.
+    // What makes it safe to offer is the return TYPE: text cannot be
+    // passed to anything expecting verified claims.
+    test.case("it hands back the payload as JSON text")
+    match jwttoken.decode(a_token())
+        Ok(t)  =>
+            let raw = jwttoken.dangerous_unverified_payload_json(t)
+            test.assert(str.starts_with(raw, "{"))
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and it works on a token whose signature is nonsense")
+    // Which is the point: an introspection endpoint explains a
+    // REJECTED token, so the function must not require a valid one.
+    match jwttoken.decode("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.bm90LWEtc2ln")
+        Ok(t)  => test.assert(str.contains(
+                      jwttoken.dangerous_unverified_payload_json(t), "sub"))
+        Err(_) => test.fail("the shape is valid even though the signature is not")
+
+@test
+fn test_a_critical_header_is_refused_rather_than_ignored() [io]
+    // RFC 7515 § 4.1.11: a verifier must refuse extensions it does not
+    // understand.  Ignoring `crit` is how a security-relevant
+    // extension gets skipped.
+    test.case("a non-empty crit fails at the decode")
+    // {"alg":"HS256","crit":["exp"]} . {} . sig
+    match jwttoken.decode("eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiZXhwIl19.e30.c2ln")
+        Err(UnsupportedCritical(ns)) => test.assert(list.len(ns) == 1)
+        Err(_)                       => test.fail("wrong reason for a crit header")
+        Ok(_)                        => test.fail("this package understands no extensions")
+
+@test
+fn test_signing_refuses_a_key_too_short_to_be_safe() [io]
+    // Refused at the SIGNING end as well as the verifying one, so the
+    // weak tokens never exist.
+    test.case("an HS256 secret under 32 bytes is WeakKey, naming both numbers")
+    let short = jwtalg.hmac_key(bytes.from_str("too-short"))
+    match jwttoken.encode(jwtclaims.header(Hs256), jwtclaims.claims(), short)
+        Err(WeakKey(given, required)) =>
+            test.assert(given == 9)
+            test.assert(required == 32)
+        Err(_)                        => test.fail("wrong reason for a short secret")
+        Ok(_)                         => test.fail("RFC 7518 § 3.2 requires 32 bytes for HS256")
+
+    test.case("and it is a configuration fault, not a client's problem")
+    test.assert(jwterror.is_configuration_fault(WeakKey(9, 32)))
+    test.assert(not jwterror.is_client_safe(WeakKey(9, 32)))
+
+@test
+fn test_the_external_signer_path_hands_the_caller_the_bytes() [io]
+    // For a key in a hardware module or a KMS, where the signing is
+    // somebody else's `[net]` or `[hw]` call.  The sans-IO answer is
+    // to hand the caller the signing input rather than take a
+    // callback whose cost a `core` function would inherit.
+    test.case("signing_input is the header.payload text a signature covers")
+    match jwttoken.signing_input(jwtclaims.header(Es256), jwtclaims.claims())
+        Ok(s)  =>
+            test.assert(str.contains(s, "."))
+            test.assert(not str.ends_with(s, "."))
+        Err(_) => test.fail("a header and empty claims serialise")
+
+    test.case("attach_signature completes the token without checking it")
+    let t = jwttoken.attach_signature("eyJhbGciOiJFUzI1NiJ9.e30", bytes.zeros(64))
+    test.assert(str.starts_with(t, "eyJhbGciOiJFUzI1NiJ9.e30."))

@@ -1,0 +1,53 @@
+[package]
+name        = "jwt-nv"
+version     = "0.0.1"
+description = "JSON Web Tokens with the unverified state unusable by construction: decoding hands back a token whose claims cannot be read until a signature check has produced a verified one, the `none` algorithm is unrepresentable, and validation is a policy value rather than a pile of optional arguments.  HS256, RS256 and ES256, over crypto-nv and p256-nv, with the current time supplied by the caller."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  Verifying a token needs the current time and a `core`
+# package may not read a clock, so an instant arrives as a PARAMETER —
+# the same shape sql-engine-nv's `NowSnapshot` takes, and the reason
+# `JwtInstant` exists.  Nothing here opens a file, resolves a name, or
+# fetches a key: a JWKS fetch is `[net]` work that belongs in a `host`
+# package on top of this one.
+layer       = "core"
+
+category    = "web"
+
+tags        = ["jwt", "jws", "hs256", "rs256", "es256", "auth", "token", "rfc-7519", "web"]
+repository  = "https://github.com/novolang/jwt-nv"
+maintainers = ["novo-lang"]
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "JSON Web Tokens whose claims cannot be read unverified"
+
+[dependencies]
+# crypto-nv supplies SHA-256 and HMAC-SHA-256: HS256 is the HMAC
+# directly, and RS256 and ES256 both sign the SHA-256 digest of the
+# signing input.  `core`, so the layer rule holds.
+crypto-nv = "^0.1"
+
+# p256-nv supplies the P-256 key types ES256's keys are made of, so
+# that a caller already holding a `p256.PublicKey` — from a device
+# pairing, from a JWKS decoder — hands the same type here rather than
+# re-encoding it through bytes.  A path dependency until both are on
+# the registry.
+#
+# NOTE FOR THE IMPLEMENTATION LANE: p256-nv 0.0.1's surface is key
+# construction, validation and ECDH.  It has no `ecdsa_sign` or
+# `ecdsa_verify`, and neither does anything else on the grid, so ES256
+# cannot be implemented until p256-nv grows them.  The same is true of
+# RS256 with more force: there is no RSA row in
+# planning/ORBIT-MUST-HAVE.md at all.  Both gaps are named in the
+# README's Status section rather than hidden behind a `todo()`.
+p256-nv   = { path = "../p256-nv", version = "^0.0.1" }

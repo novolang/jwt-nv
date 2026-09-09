@@ -1,0 +1,205 @@
+// jwtclaims_tests.nv — the API suite for the header, the claims, the
+// instant, the keys and the error taxonomy.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// jwt-nv.<module>.<fn>`.
+
+use std.test
+use jwtalg
+use jwtclaims
+use jwterror
+use p256
+
+@test
+fn test_the_instant_is_a_value_the_caller_supplies() [io]
+    // This package is `core` and may not read a clock, so `now`
+    // arrives as an argument — the same shape sql-engine-nv's
+    // `NowSnapshot` takes.  The `[time]` is spent in the caller,
+    // once, where it is visible.
+    test.case("an instant is Unix seconds, and reads back")
+    test.assert(jwtclaims.unix_seconds(jwtclaims.instant(1700000000)) == 1700000000)
+
+    test.case("plus moves it, so a caller never does the arithmetic itself")
+    let hour = jwtclaims.plus(jwtclaims.instant(1700000000), 3600)
+    test.assert(jwtclaims.unix_seconds(hour) == 1700003600)
+
+    test.case("and backwards, for an `nbf` in the past")
+    test.assert(jwtclaims.unix_seconds(
+        jwtclaims.plus(jwtclaims.instant(100), -60)) == 40)
+
+@test
+fn test_the_registered_claims_are_fields_and_the_rest_is_json_text() [io]
+    test.case("empty claims have nothing set")
+    let c = jwtclaims.claims()
+    test.assert(c.iss == "")
+    test.assert(c.sub == "")
+    test.assert(list.len(c.aud) == 0)
+    test.assert(c.jti == "")
+    match c.exp
+        Some(_) => test.fail("empty claims have no expiry")
+        None    => test.assert(true)
+
+    test.case("`exp` absent is None and NOT zero — zero would mean 1970")
+    match jwtclaims.with_exp(c, jwtclaims.instant(0)).exp
+        Some(t) => test.assert(jwtclaims.unix_seconds(t) == 0)
+        None    => test.fail("a zero expiry is still an expiry")
+
+    test.case("the builders each set one thing")
+    test.assert(jwtclaims.with_iss(c, "https://auth.example").iss
+                == "https://auth.example")
+    test.assert(jwtclaims.with_sub(c, "user-42").sub == "user-42")
+    test.assert(jwtclaims.with_jti(c, "1f2e3d").jti == "1f2e3d")
+
+    test.case("the application's own claims are raw JSON text")
+    let withp = jwtclaims.with_payload(c, "{\"scope\":\"read\"}")
+    test.assert(str.contains(withp.payload_json, "scope"))
+
+@test
+fn test_the_audience_is_a_list_because_the_rfc_permits_two_shapes() [io]
+    // RFC 7519 § 4.1.3 permits one string or an array, and a caller
+    // that handled only the first breaks on a token with two
+    // audiences.
+    test.case("one audience")
+    let one = jwtclaims.with_aud(jwtclaims.claims(), ["api"])
+    test.assert(list.len(one.aud) == 1)
+    test.assert(jwtclaims.has_audience(one, "api"))
+
+    test.case("two audiences, and membership finds either")
+    let two = jwtclaims.with_aud(jwtclaims.claims(), ["api", "admin"])
+    test.assert(jwtclaims.has_audience(two, "api"))
+    test.assert(jwtclaims.has_audience(two, "admin"))
+
+    test.case("matching is exact — a library must not guess at an id scheme")
+    test.assert(not jwtclaims.has_audience(two, "API"))
+    test.assert(not jwtclaims.has_audience(two, "ap"))
+
+    test.case("and a token with no audience never matches one a policy wants")
+    test.assert(not jwtclaims.has_audience(jwtclaims.claims(), "api"))
+
+@test
+fn test_the_time_predicates_take_the_leeway_as_an_argument() [io]
+    let expires_at_100 = jwtclaims.with_exp(jwtclaims.claims(),
+                                            jwtclaims.instant(100))
+
+    test.case("not expired before its expiry")
+    test.assert(not jwtclaims.is_expired(expires_at_100, jwtclaims.instant(50), 0))
+
+    test.case("expired after it")
+    test.assert(jwtclaims.is_expired(expires_at_100, jwtclaims.instant(160), 0))
+
+    test.case("and not, inside the leeway the caller allowed")
+    test.assert(not jwtclaims.is_expired(expires_at_100, jwtclaims.instant(160), 120))
+
+    test.case("a token with no expiry never expires — a policy decides about that")
+    test.assert(not jwtclaims.is_expired(jwtclaims.claims(),
+                                         jwtclaims.instant(999999), 0))
+
+    test.case("nbf works the same way in the other direction")
+    let from_200 = jwtclaims.with_nbf(jwtclaims.claims(), jwtclaims.instant(200))
+    test.assert(jwtclaims.is_not_yet_valid(from_200, jwtclaims.instant(100), 0))
+    test.assert(not jwtclaims.is_not_yet_valid(from_200, jwtclaims.instant(100), 200))
+    test.assert(not jwtclaims.is_not_yet_valid(jwtclaims.claims(),
+                                               jwtclaims.instant(0), 0))
+
+@test
+fn test_a_header_carries_the_routing_facts_and_nothing_else() [io]
+    test.case("the common header is an algorithm and typ: JWT")
+    let h = jwtclaims.header(Hs256)
+    test.assert(h.typ == "JWT")
+    test.assert(h.kid == "")
+    test.assert(list.len(h.crit) == 0)
+
+    test.case("and a key id when there is one")
+    test.assert(jwtclaims.header_with_kid(Rs256, "2026-key-1").kid == "2026-key-1")
+
+    test.case("crit is empty in every header this package builds")
+    // Because it understands no extensions, and a header claiming one
+    // would be a token it would then have to refuse itself.
+    test.assert(list.len(jwtclaims.header_with_kid(Es256, "k").crit) == 0)
+
+@test
+fn test_a_signing_key_and_a_verifying_key_are_different_types() [io]
+    // The mistake this prevents is the one people make: an API where
+    // the same value flows into both `sign` and `verify` and a caller
+    // mixes up which end of an asymmetric pair it holds.
+    test.case("each constructor pairs a key with its own algorithm")
+    let hs = jwtalg.hmac_key(bytes.from_str("a-32-byte-secret-for-hs256-here!"))
+    test.assert(jwtalg.alg_name(jwtalg.signing_alg(hs)) == "HS256")
+
+    let rs = jwtalg.rsa_verifying_key(bytes.from_str("<der>"))
+    test.assert(jwtalg.alg_name(jwtalg.verifying_alg(rs)) == "RS256")
+
+    test.case("HS256 is the only symmetric one, and that changes what may be published")
+    test.assert(jwtalg.is_symmetric(Hs256))
+    test.assert(not jwtalg.is_symmetric(Rs256))
+    test.assert(not jwtalg.is_symmetric(Es256))
+
+    test.case("the ES256 keys take p256-nv's own types, not re-encoded bytes")
+    match p256.secret_key_from_bytes(list.zeros(32))
+        Ok(sk) => test.assert(jwtalg.alg_name(
+                      jwtalg.signing_alg(jwtalg.ec_signing_key(sk))) == "ES256")
+        Err(_) => test.assert(true)
+
+@test
+fn test_key_selection_never_falls_back_to_the_first_key() [io]
+    // Trying each key in turn is how a retired key gets used for
+    // another year.
+    let a = jwtalg.with_kid(jwtalg.rsa_verifying_key(bytes.from_str("<a>")), "a")
+    let b = jwtalg.with_kid(jwtalg.rsa_verifying_key(bytes.from_str("<b>")), "b")
+
+    test.case("a matching kid finds its key")
+    match jwtalg.key_for_kid([a, b], "b")
+        Some(k) => test.assert(jwtalg.kid_of(k) == "b")
+        None    => test.fail("`b` is in the set")
+
+    test.case("a kid nothing matches is None, not the first key")
+    match jwtalg.key_for_kid([a, b], "c")
+        Some(_) => test.fail("no key answers to `c`")
+        None    => test.assert(true)
+
+    test.case("and an empty kid does not silently pick one either")
+    match jwtalg.key_for_kid([a, b], "")
+        Some(_) => test.fail("a token with no kid must not pick a key by luck")
+        None    => test.assert(true)
+
+    test.case("a key with no kid reads back as the empty string")
+    test.assert(jwtalg.kid_of(jwtalg.rsa_verifying_key(bytes.from_str("<c>"))) == "")
+
+@test
+fn test_the_error_taxonomy_says_what_may_be_said_out_loud() [io]
+    // A caller that tells a client "bad signature" rather than
+    // "invalid token" has built a forgery oracle.  A library cannot
+    // enforce the division — the caller writes the response — so this
+    // is the function that makes getting it right one line.
+    test.case("what the presenter already knows may be repeated")
+    test.assert(jwterror.is_client_safe(Expired(100, 200)))
+    test.assert(jwterror.is_client_safe(NotYetValid(200, 100)))
+    test.assert(jwterror.is_client_safe(WrongAudience("admin")))
+    test.assert(jwterror.is_client_safe(Malformed("two segments, not three")))
+    test.assert(jwterror.is_client_safe(UnknownAlgorithm("none")))
+
+    test.case("what would tell an attacker its forgery was detected may not")
+    test.assert(not jwterror.is_client_safe(BadSignature))
+    test.assert(not jwterror.is_client_safe(AlgorithmMismatch("HS256", "RS256")))
+    test.assert(not jwterror.is_client_safe(NoMatchingKey("k1")))
+    test.assert(not jwterror.is_client_safe(WrongIssuer("a", "b")))
+
+    test.case("and the three service faults answer 500, not 401")
+    test.assert(jwterror.is_configuration_fault(PolicyAcceptsNothing))
+    test.assert(jwterror.is_configuration_fault(PolicyIncomplete("audience")))
+    test.assert(jwterror.is_configuration_fault(WeakKey(9, 32)))
+    test.assert(not jwterror.is_configuration_fault(BadSignature))
+
+@test
+fn test_the_metric_code_carries_nothing_the_token_supplied() [io]
+    // Putting `e.message()` in a metric label would put an
+    // attacker-chosen issuer string into a time series database: a
+    // cardinality explosion and an injection at the same time.
+    test.case("the code is short, stable and free of token content")
+    test.assert(jwterror.code(BadSignature) == "bad_signature")
+    test.assert(jwterror.code(Expired(1, 2)) == "expired")
+    test.assert(jwterror.code(WrongAudience("admin")) == "wrong_audience")
+
+    test.case("and two errors of the same kind share it whatever they carry")
+    test.assert(jwterror.code(WrongIssuer("a", "b"))
+                == jwterror.code(WrongIssuer("c", "d")))

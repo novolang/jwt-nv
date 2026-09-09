@@ -1,0 +1,350 @@
+// jwtalg.nv — the algorithms, and the two key types that cannot be
+// used for each other's job.
+//
+// `none` IS UNREPRESENTABLE
+//
+// RFC 7519's most famous vulnerability is the `alg: none` token: an
+// attacker strips the signature, sets the header's algorithm to
+// `none`, and a library that treats `none` as an algorithm accepts it.
+// Every JWT library has shipped this bug at least once, and the fixes
+// have all been the same shape — a check, somewhere, that a reviewer
+// has to find and a refactor can delete.
+//
+// Here it is not a check.  `JwtAlg` has three arms and none of them is
+// `none`, so there is no value a caller or a decoder could construct
+// that means "unsigned".  A token whose header says `alg: none` does
+// not produce a `JwtAlg` at all — it is `UnknownAlgorithm` at the
+// decode, before anything else happens, and the error names what was
+// written so a log can show it.
+//
+// TWO KEY TYPES, SO A PUBLIC KEY CANNOT SIGN
+//
+// `JwtSigningKey` and `JwtVerifyingKey` are separate types rather than
+// one `JwtKey` with a role field, because the mistake they prevent is
+// the one people actually make: verifying an RS256 token with the
+// private key (harmless but confusing), or worse, an API where the
+// same value flows into both `sign` and `verify` and a caller mixes up
+// which end of an asymmetric pair it holds.  With two types the
+// compiler settles it, and the HMAC case — where the two really are
+// the same secret — makes that explicit by having a constructor for
+// each rather than by blurring the distinction for everybody.
+//
+// THE ALGORITHM IS THE KEY'S, NOT THE TOKEN'S
+//
+// The other classic JWT vulnerability is algorithm confusion: a token
+// signed with HS256 using the RSA *public* key as the HMAC secret,
+// accepted by a verifier that read the algorithm out of the token's
+// own header.  So no function here takes an algorithm from the header.
+// A `JwtVerifyingKey` carries the one algorithm it is for, `JwtPolicy`
+// carries the list a caller will accept, and a token whose header
+// disagrees with the key is `AlgorithmMismatch`.  The header's `alg`
+// is a routing hint for picking a key, never an instruction.
+
+use p256
+
+// A signature algorithm this package implements.
+//
+// Three arms, and the absence of a fourth is the design: `none` is not
+// here, so no value means "unsigned".
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     println(jwtalg.alg_name(Hs256))           // HS256
+// ```
+pub enum JwtAlg
+    // HMAC with SHA-256 (RFC 7518 § 3.2).  A shared secret: whoever
+    // can verify can also sign, which is why it belongs between two
+    // parties that already trust each other and not on a public API.
+    Hs256
+    // RSASSA-PKCS1-v1_5 with SHA-256 (RFC 7518 § 3.3).
+    Rs256
+    // ECDSA using P-256 and SHA-256 (RFC 7518 § 3.4).
+    Es256
+
+// A key that can produce a signature.
+//
+// Constructed by the three functions below, one per algorithm, so the
+// key and its algorithm arrive together and a caller cannot pair an
+// RSA key with `Hs256`.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.hmac_key(bytes.from_str("a-32-byte-secret-for-hs256-here!"))
+//     match jwtalg.signing_alg(k)
+//         Hs256 => println("HS256")
+//         _     => println("something else")
+// ```
+pub struct JwtSigningKey
+    // Which algorithm this key signs with.  Read it with
+    // `signing_alg`; the field is here so the type is reviewable.
+    alg: JwtAlg
+    // The HMAC secret, for `Hs256`.  Empty otherwise.
+    secret: Bytes
+    // The RSA private key in PKCS#1 form, for `Rs256`.  Empty
+    // otherwise.  Bytes rather than a structured type because no
+    // package on the grid holds RSA keys yet — see the README's
+    // Status section, which names that gap rather than hiding it.
+    rsa_der: Bytes
+    // The P-256 private key, for `Es256`.  p256-nv's type, so a
+    // caller that already holds one hands it over rather than
+    // re-encoding it through bytes.
+    ec_secret: ?p256.SecretKey
+
+// A key that can check a signature, and nothing else.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.hmac_verifying_key(bytes.from_str("a-32-byte-secret-for-hs256-here!"))
+//     println(jwtalg.alg_name(jwtalg.verifying_alg(k)))   // HS256
+// ```
+pub struct JwtVerifyingKey
+    // Which algorithm this key verifies.  A token whose header names
+    // a different one is `AlgorithmMismatch`, which is what closes
+    // the algorithm-confusion attack.
+    alg: JwtAlg
+    // The HMAC secret, for `Hs256`.  Empty otherwise.
+    secret: Bytes
+    // The RSA public key in PKCS#1 form, for `Rs256`.  Empty
+    // otherwise.
+    rsa_der: Bytes
+    // The P-256 public key, for `Es256`.
+    ec_public: ?p256.PublicKey
+    // The key identifier this key answers to, or `""`.  Matched
+    // against a token's `kid` by a caller choosing between several
+    // keys — this package never fetches one, so choosing is the
+    // caller's job and `kid_of` is what it needs to do it.
+    kid: Str
+
+// The algorithm's name as it appears in a JOSE header: `"HS256"`,
+// `"RS256"`, `"ES256"`.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     println(jwtalg.alg_name(Es256))           // ES256
+// ```
+pub fn alg_name(a: JwtAlg) -> Str
+    todo("jwt-nv.jwtalg.alg_name")
+
+// The algorithm a header name denotes, or `None`.
+//
+// `"none"` answers `None`, and so does `"NONE"`, `"None"` and every
+// other spelling — because the arm does not exist, not because a check
+// rejects it.  So does every algorithm this package has not
+// implemented: `"HS512"`, `"PS256"`, `"EdDSA"`.  A caller that needs
+// one of those needs a version of this package that has it, and being
+// told so is better than being told nothing.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     match jwtalg.alg_named("none")
+//         Some(_) => println("this cannot happen")
+//         None    => println("`none` is not an algorithm here")
+// ```
+pub fn alg_named(name: Str) -> ?JwtAlg
+    todo("jwt-nv.jwtalg.alg_named")
+
+// Whether an algorithm is symmetric — one secret both signs and
+// verifies.
+//
+// True for `Hs256` only.  It is here because the distinction changes
+// what a caller may safely do with a key: an HS256 secret must never
+// leave the parties that share it, and an RS256 or ES256 verifying key
+// is meant to be published.  A caller writing a JWKS endpoint, or
+// deciding what may go in a config file, is asking exactly this.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     println("${jwtalg.is_symmetric(Hs256)}")   // true
+//     println("${jwtalg.is_symmetric(Es256)}")   // false
+// ```
+pub fn is_symmetric(a: JwtAlg) -> Bool
+    todo("jwt-nv.jwtalg.is_symmetric")
+
+// An HS256 signing key from a shared secret.
+//
+// RFC 7518 § 3.2 requires a key at least as long as the hash output —
+// 32 bytes for SHA-256 — and a shorter one produces a key that is
+// already refused: `sign` answers `WeakKey` rather than silently
+// signing with a secret an attacker can brute-force.  The check is at
+// use rather than here because a constructor has no error channel, and
+// one failure path is better than two.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.hmac_key(bytes.from_str("a-32-byte-secret-for-hs256-here!"))
+//     println(jwtalg.alg_name(jwtalg.signing_alg(k)))    // HS256
+// ```
+pub fn hmac_key(secret: Bytes) -> JwtSigningKey
+    todo("jwt-nv.jwtalg.hmac_key")
+
+// An HS256 verifying key from the same shared secret.
+//
+// A separate constructor from `hmac_key` even though the bytes are
+// identical, because the TYPES are what carry the distinction
+// everywhere else and blurring it here for the one symmetric case
+// would put a `JwtSigningKey` where a verifier expects a
+// `JwtVerifyingKey`.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.hmac_verifying_key(bytes.from_str("a-32-byte-secret-for-hs256-here!"))
+//     println("${jwtalg.is_symmetric(jwtalg.verifying_alg(k))}")   // true
+// ```
+pub fn hmac_verifying_key(secret: Bytes) -> JwtVerifyingKey
+    todo("jwt-nv.jwtalg.hmac_verifying_key")
+
+// An RS256 signing key from a PKCS#1 private key.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.rsa_signing_key(bytes.from_str("<der>"))
+//     println(jwtalg.alg_name(jwtalg.signing_alg(k)))    // RS256
+// ```
+pub fn rsa_signing_key(pkcs1_der: Bytes) -> JwtSigningKey
+    todo("jwt-nv.jwtalg.rsa_signing_key")
+
+// An RS256 verifying key from a PKCS#1 public key.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.rsa_verifying_key(bytes.from_str("<der>"))
+//     println(jwtalg.alg_name(jwtalg.verifying_alg(k)))  // RS256
+// ```
+pub fn rsa_verifying_key(pkcs1_der: Bytes) -> JwtVerifyingKey
+    todo("jwt-nv.jwtalg.rsa_verifying_key")
+
+// An ES256 signing key from a P-256 private key.
+//
+// Takes p256-nv's own type, so a caller that already holds one — from
+// a device pairing, from a key file it decoded — hands it over rather
+// than round-tripping through bytes and losing the validation
+// p256-nv already did.
+//
+// ```novo
+// use jwtalg
+// use p256
+//
+// fn main() [io]
+//     match p256.secret_key_from_bytes(list.zeros(32))
+//         Ok(sk) => println(jwtalg.alg_name(jwtalg.signing_alg(jwtalg.ec_signing_key(sk))))
+//         Err(_) => println("not a valid scalar")
+// ```
+pub fn ec_signing_key(secret: p256.SecretKey) -> JwtSigningKey
+    todo("jwt-nv.jwtalg.ec_signing_key")
+
+// An ES256 verifying key from a P-256 public key.
+//
+// ```novo
+// use jwtalg
+// use p256
+//
+// fn main() [io]
+//     match p256.public_key_from_bytes(list.zeros(32),
+//                                      list.zeros(32))
+//         Ok(pk) => println(jwtalg.alg_name(jwtalg.verifying_alg(jwtalg.ec_verifying_key(pk))))
+//         Err(_) => println("not a point on the curve")
+// ```
+pub fn ec_verifying_key(public: p256.PublicKey) -> JwtVerifyingKey
+    todo("jwt-nv.jwtalg.ec_verifying_key")
+
+// The algorithm a signing key signs with.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.hmac_key(bytes.from_str("a-32-byte-secret-for-hs256-here!"))
+//     println(jwtalg.alg_name(jwtalg.signing_alg(k)))    // HS256
+// ```
+pub fn signing_alg(k: JwtSigningKey) -> JwtAlg
+    todo("jwt-nv.jwtalg.signing_alg")
+
+// The algorithm a verifying key checks.
+//
+// THE FUNCTION THAT CLOSES ALGORITHM CONFUSION.  The verifier compares
+// this with the token's header and refuses a mismatch, so a token
+// signed HS256 with an RSA public key as the secret cannot be accepted
+// by a verifier holding that key for RS256 — the classic attack, and
+// the reason no function in this package ever reads the algorithm out
+// of the token to decide what to do.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.rsa_verifying_key(bytes.from_str("<der>"))
+//     println(jwtalg.alg_name(jwtalg.verifying_alg(k)))  // RS256
+// ```
+pub fn verifying_alg(k: JwtVerifyingKey) -> JwtAlg
+    todo("jwt-nv.jwtalg.verifying_alg")
+
+// A verifying key with a key identifier attached.
+//
+// `kid_of` reads it back, and a caller holding several keys matches it
+// against a token's `kid` to choose one.  This package never fetches a
+// key — that is `[net]` work and this is `core` — so choosing is
+// always the caller's, and this is the pair of functions that makes it
+// possible without a second type.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let k = jwtalg.with_kid(jwtalg.rsa_verifying_key(bytes.from_str("<der>")),
+//                             "2026-key-1")
+//     println(jwtalg.kid_of(k))                 // 2026-key-1
+// ```
+pub fn with_kid(k: JwtVerifyingKey, kid: Str) -> JwtVerifyingKey
+    todo("jwt-nv.jwtalg.with_kid")
+
+// The key identifier a verifying key answers to, or `""`.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     println(jwtalg.kid_of(jwtalg.rsa_verifying_key(bytes.from_str("<der>"))))  // (empty)
+// ```
+pub fn kid_of(k: JwtVerifyingKey) -> Str
+    todo("jwt-nv.jwtalg.kid_of")
+
+// The verifying key from a set whose `kid` matches, or `None`.
+//
+// The whole of this package's key-selection story, and it is a plain
+// list scan because a caller with more keys than that has a JWKS
+// cache, which is a `host` package's job.  `None` when nothing
+// matches, and `None` for an empty `kid` unless a key has one too —
+// so a token with no `kid` does not silently pick the first key,
+// which is how a rotated-out key gets used.
+//
+// ```novo
+// use jwtalg
+//
+// fn main() [io]
+//     let keys = [jwtalg.with_kid(jwtalg.rsa_verifying_key(bytes.from_str("<a>")), "a")]
+//     match jwtalg.key_for_kid(keys, "a")
+//         Some(_) => println("found")
+//         None    => println("no key with that id")
+// ```
+pub fn key_for_kid(keys: [JwtVerifyingKey], kid: Str) -> ?JwtVerifyingKey
+    todo("jwt-nv.jwtalg.key_for_kid")

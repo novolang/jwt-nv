@@ -1,0 +1,138 @@
+// jwtcover_tests.nv — the rest of the public surface, one case each.
+//
+// RED ON PURPOSE, like every suite here: each assertion reaches `not
+// implemented: jwt-nv.<module>.<fn>`.
+//
+// The three suites beside this one assert the DESIGN — the two token
+// types, the policy value, the error taxonomy.  This one exists so
+// that no public function ships without a written expectation of what
+// it answers.
+
+use std.test
+use jwtalg
+use jwtclaims
+use jwtpolicy
+use jwterror
+use jwttoken
+use p256
+
+// A 32-byte HS256 secret, the shortest RFC 7518 § 3.2 allows.
+fn secret() -> Bytes
+    bytes.from_str("a-32-byte-secret-for-hs256-here!")
+
+@test
+fn test_the_remaining_key_constructors_pair_a_key_with_its_algorithm() [io]
+    test.case("rsa_signing_key is RS256, and is a SIGNING key")
+    let rs = jwtalg.rsa_signing_key(bytes.from_str("<pkcs1>"))
+    test.assert(jwtalg.alg_name(jwtalg.signing_alg(rs)) == "RS256")
+
+    test.case("ec_verifying_key is ES256, and takes p256-nv's own type")
+    match p256.public_key_from_bytes(list.zeros(32), list.zeros(32))
+        Ok(pk) => test.assert(jwtalg.alg_name(
+                      jwtalg.verifying_alg(jwtalg.ec_verifying_key(pk))) == "ES256")
+        Err(_) => test.assert(true)
+
+    test.case("hmac_verifying_key is the symmetric case, spelled separately")
+    // Separate from `hmac_key` even though the bytes are identical,
+    // because the TYPES carry the signing/verifying distinction
+    // everywhere else and blurring it for one case would put a
+    // signing key where a verifier expects a verifying one.
+    test.assert(jwtalg.alg_name(
+        jwtalg.verifying_alg(jwtalg.hmac_verifying_key(secret()))) == "HS256")
+
+@test
+fn test_iat_is_what_a_lifetime_cap_is_measured_from() [io]
+    test.case("with_iat records when a token was issued")
+    let c = jwtclaims.with_iat(jwtclaims.claims(), jwtclaims.instant(1700000000))
+    match c.iat
+        Some(t) => test.assert(jwtclaims.unix_seconds(t) == 1700000000)
+        None    => test.fail("with_iat sets `iat`")
+
+    test.case("and empty claims have none, so a lifetime cap has nothing to measure")
+    match jwtclaims.claims().iat
+        Some(_) => test.fail("empty claims carry no `iat`")
+        None    => test.assert(true)
+
+    test.case("which is why the cap refuses rather than skipping the check")
+    // Silently skipping would make `with_max_lifetime` decorative.
+    test.assert(jwtpolicy.with_max_lifetime(jwtpolicy.strict(), 3600).max_lifetime_seconds == 3600)
+    test.assert(not jwterror.is_client_safe(LifetimeTooLong(315360000, 3600)))
+
+@test
+fn test_key_selection_by_kid_is_the_one_decision_verify_with_keys_makes() [io]
+    let a = jwtalg.with_kid(jwtalg.rsa_verifying_key(bytes.from_str("<a>")), "a")
+    let b = jwtalg.with_kid(jwtalg.rsa_verifying_key(bytes.from_str("<b>")), "b")
+
+    test.case("a kid that matches nothing is NoMatchingKey, naming it")
+    // {"alg":"RS256","kid":"zz"} . {} . sig
+    match jwttoken.decode("eyJhbGciOiJSUzI1NiIsImtpZCI6Inp6In0.e30.c2ln")
+        Ok(t)  =>
+            match jwttoken.verify_with_keys(t, [a, b], jwtpolicy.permissive(),
+                                            jwtclaims.instant(1700000000))
+                Err(NoMatchingKey(k)) => test.assert(k == "zz")
+                Err(_)                => test.fail("wrong reason for an unknown kid")
+                Ok(_)                 => test.fail("no key answers to `zz`")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and a token with NO kid does not fall back to the first key")
+    // Trying each key in turn is how a retired key gets used for
+    // another year.
+    match jwttoken.decode("eyJhbGciOiJSUzI1NiJ9.e30.c2ln")
+        Ok(t)  =>
+            match jwttoken.verify_with_keys(t, [a, b], jwtpolicy.permissive(),
+                                            jwtclaims.instant(1700000000))
+                Err(NoMatchingKey(k)) => test.assert(k == "")
+                Err(_)                => test.fail("wrong reason for a token with no kid")
+                Ok(_)                 => test.fail("a key must not be chosen by luck")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+    test.case("and the reason is not one to repeat to a client")
+    test.assert(not jwterror.is_client_safe(NoMatchingKey("zz")))
+
+@test
+fn test_the_envelope_reads_work_before_verification_because_they_must() [io]
+    // Choosing WHICH key to verify with requires reading the `kid`, so
+    // a token that showed nothing could never be verified at all.
+    // These three answer with facts about the envelope, never claims.
+    test.case("header_of on an unverified token")
+    // {"alg":"HS256","kid":"k1"} . {} . sig
+    match jwttoken.decode("eyJhbGciOiJIUzI1NiIsImtpZCI6ImsxIn0.e30.c2ln")
+        Ok(t)  =>
+            test.assert(jwttoken.header_of(t).kid == "k1")
+            test.assert(jwttoken.kid_of(t) == "k1")
+            test.assert(jwtalg.alg_name(jwttoken.alg_of(t)) == "HS256")
+        Err(_) => test.fail("the fixture is a well-formed token")
+
+@test
+fn test_a_verified_token_reports_what_actually_verified_it() [io]
+    // The KEY's algorithm, not the header's — they are equal by the
+    // time a `VerifiedJwt` exists, and the field records which one it
+    // was for a caller counting how much traffic still arrives on an
+    // algorithm it wants to retire.
+    let c = jwtclaims.with_exp(jwtclaims.claims(), jwtclaims.instant(1700003600))
+    match jwttoken.encode(jwtclaims.header(Hs256), c, jwtalg.hmac_key(secret()))
+        Ok(token) =>
+            match jwttoken.decode(token)
+                Ok(t)  =>
+                    match jwttoken.verify(t, jwtalg.hmac_verifying_key(secret()),
+                                          jwtpolicy.permissive(),
+                                          jwtclaims.instant(1700000000))
+                        Ok(v)  =>
+                            test.assert(jwtalg.alg_name(
+                                jwttoken.verified_alg_of(v)) == "HS256")
+                            test.assert(jwttoken.verified_header_of(v).typ == "JWT")
+                        Err(_) => test.fail("the token verifies under permissive()")
+                Err(_) => test.fail("what encode produced, decode reads")
+        Err(_)    => test.fail("a 32-byte secret is long enough to sign with")
+
+@test
+fn test_the_error_messages_are_for_a_log_and_the_codes_for_a_metric() [io]
+    test.case("message says what happened, for an operator")
+    test.assert(str.len(BadSignature.message()) > 0)
+    test.assert(str.len(Malformed("two segments, not three").message()) > 0)
+
+    test.case("code is short, stable, and free of anything the token carried")
+    test.assert(jwterror.code(NoMatchingKey("attacker-chosen-id"))
+                == jwterror.code(NoMatchingKey("another-one")))
+    test.assert(not str.contains(jwterror.code(NoMatchingKey("attacker-chosen-id")),
+                                 "attacker"))

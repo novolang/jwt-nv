@@ -1,0 +1,396 @@
+// jwtclaims.nv — the header, the claims, and the instant that has to
+// arrive from outside.
+//
+// WHY THE TIME IS A PARAMETER
+//
+// Verifying a token means comparing `exp` and `nbf` against now, and
+// this is a `core` package: its budget is no effects at all, so it may
+// not read a clock.  That is not an obstacle worked around, it is the
+// design working — the same shape `sql-engine-nv` takes with
+// `NowSnapshot` when it has to evaluate `CURRENT_TIMESTAMP` without
+// reaching for `[time]`.
+//
+// So `JwtInstant` is a value the caller supplies:
+//
+//     let now = jwtclaims.instant(time.unix_seconds())   // [time], in the host
+//     jwttoken.verify(t, key, policy, now)               // [], here
+//
+// The `[time]` is spent once, in the caller, where it is visible.  And
+// it buys something beyond the layer rule: a test can verify a token
+// at any instant it likes without a fake clock, an audit tool can ask
+// "was this token valid when it was presented" rather than only "is it
+// valid now", and a replay of a request log gets the same answers it
+// got the first time.  A library that read the clock itself could do
+// none of those.
+//
+// WHAT IS AND IS NOT IN `JwtClaims`
+//
+// The seven registered claims of RFC 7519 § 4.1 have fields, because
+// they are what validation is about and a caller reading `exp` should
+// not have to go through a string map.  Everything else — the
+// application's own claims, `scope`, `roles`, whatever an identity
+// provider adds — is in `extra`, as the raw JSON text of the payload.
+//
+// Raw text rather than a parsed tree, and that is a deliberate cost.
+// A parsed tree would mean this package declares a JSON value type,
+// which would then collide with the one `serde-nv` or a caller's own
+// decoder already has (`docs/publishing.md` § Public type names are
+// globally unique), and would put a JSON model in the dependency
+// footprint of every embedded consumer that only wanted to check an
+// `exp`.  The caller already has a JSON decoder; handing it the bytes
+// is cheaper than agreeing on a tree.
+
+// A point in time, as seconds since the Unix epoch.
+//
+// A named type rather than a bare `Int` so that a signature cannot
+// take the leeway and the instant in the wrong order, and so that the
+// place a program spends `[time]` is greppable: every call to
+// `instant` is one.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     println("${jwtclaims.unix_seconds(jwtclaims.instant(1700000000))}")
+// ```
+pub struct JwtInstant
+    // Seconds since 1970-01-01T00:00:00Z, as RFC 7519 § 2's
+    // NumericDate counts them: UTC, no leap seconds.
+    seconds: Int
+
+// An instant from a Unix timestamp.
+//
+// The caller reads its own clock — `time.unix_seconds()`, a header a
+// proxy set, a fixture — and this wraps it.  That call is where the
+// `[time]` is spent, and this package never spends any.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let now = jwtclaims.instant(1700000000)
+//     println("${jwtclaims.unix_seconds(now)}")  // 1700000000
+// ```
+pub fn instant(unix_seconds: Int) -> JwtInstant
+    todo("jwt-nv.jwtclaims.instant")
+
+// The Unix timestamp an instant holds.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     println("${jwtclaims.unix_seconds(jwtclaims.instant(0))}")   // 0
+// ```
+pub fn unix_seconds(t: JwtInstant) -> Int
+    todo("jwt-nv.jwtclaims.unix_seconds")
+
+// An instant a number of seconds later, or earlier for a negative
+// number.
+//
+// It is here so that a caller building an `exp` writes
+// `jwtclaims.plus(now, 3600)` rather than doing arithmetic on the
+// integer inside and rewrapping it, which is the sort of thing that
+// gets an hour wrong in one place out of four.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let hour = jwtclaims.plus(jwtclaims.instant(0), 3600)
+//     println("${jwtclaims.unix_seconds(hour)}")   // 3600
+// ```
+pub fn plus(t: JwtInstant, seconds: Int) -> JwtInstant
+    todo("jwt-nv.jwtclaims.plus")
+
+// A JOSE header, with the fields RFC 7515 § 4.1 registers and this
+// package acts on.
+//
+// `alg` is a `JwtAlg`, which is why a header carrying `none` cannot be
+// built: `jwttoken.decode` refuses it before a header exists.
+//
+// The header is readable from an UNVERIFIED token, and that is
+// deliberate — `kid` and `alg` are how a caller picks which key to
+// verify with, so refusing to show them would make verification
+// impossible.  They are routing facts about the token's envelope, not
+// claims about the world, and nothing in this package lets a caller
+// act on them as if they were.
+//
+// ```novo
+// use jwtclaims
+// use jwtalg
+//
+// fn main() [io]
+//     let h = jwtclaims.header(Hs256)
+//     println(jwtalg.alg_name(h.alg))           // HS256
+// ```
+pub struct JwtHeader
+    // The signature algorithm.  Never `none`, because there is no
+    // such value.
+    alg: JwtAlg
+    // The `typ` header, conventionally `"JWT"`, or `""` when absent.
+    typ: Str
+    // The key identifier, or `""`.  What a caller matches against its
+    // key set with `jwtalg.key_for_kid`.
+    kid: Str
+    // The `cty` content type, or `""`.
+    cty: Str
+    // The `crit` header's names: extensions the token says a verifier
+    // MUST understand.  This package understands none of them, so a
+    // non-empty `crit` is `UnsupportedCritical` at the decode rather
+    // than ignored — RFC 7515 § 4.1.11 requires exactly that, and
+    // ignoring it is how a security-relevant extension gets skipped.
+    crit: [Str]
+
+// A header with just an algorithm, `typ: "JWT"`, and nothing else.
+//
+// The header a caller signing a token wants nine times in ten.
+// `with_kid` adds the one field the tenth needs.
+//
+// ```novo
+// use jwtclaims
+// use jwtalg
+//
+// fn main() [io]
+//     println(jwtclaims.header(Es256).typ)      // JWT
+// ```
+pub fn header(alg: JwtAlg) -> JwtHeader
+    todo("jwt-nv.jwtclaims.header")
+
+// A header with a key identifier.
+//
+// ```novo
+// use jwtclaims
+// use jwtalg
+//
+// fn main() [io]
+//     println(jwtclaims.header_with_kid(Rs256, "2026-key-1").kid)
+// ```
+pub fn header_with_kid(alg: JwtAlg, kid: Str) -> JwtHeader
+    todo("jwt-nv.jwtclaims.header_with_kid")
+
+// The claims of a token: RFC 7519 § 4.1's seven registered ones as
+// fields, and everything else as the payload's raw JSON.
+//
+// A `JwtClaims` value in a caller's hands ALWAYS came out of a
+// verified token, because the only function that produces one from a
+// token takes a `VerifiedJwt`.  That is the whole point of the two
+// token types, and it is why this struct has no "is this trustworthy"
+// field — the type it can be obtained from is the answer.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let c = jwtclaims.claims()
+//     println("${jwtclaims.is_expired(c, jwtclaims.instant(0), 0)}")   // false
+// ```
+pub struct JwtClaims
+    // `iss` — who issued the token, or `""`.
+    iss: Str
+    // `sub` — who the token is about, or `""`.
+    sub: Str
+    // `aud` — who the token is for.  A LIST, because RFC 7519
+    // § 4.1.3 permits either one string or an array and a caller that
+    // handled only the first breaks on the second.  Empty when
+    // absent.
+    aud: [Str]
+    // `exp` — expiry, or `None` when the token does not expire.
+    // `None` and not zero: a token with no `exp` is a real thing an
+    // issuer produces, and `0` would mean "expired in 1970", which is
+    // the opposite.
+    exp: ?JwtInstant
+    // `nbf` — not valid before, or `None`.
+    nbf: ?JwtInstant
+    // `iat` — when it was issued, or `None`.
+    iat: ?JwtInstant
+    // `jti` — the token's unique identifier, or `""`.  What a replay
+    // check keys on; this package does not do that check, because it
+    // needs storage and storage is a host effect.
+    jti: Str
+    // The whole payload as JSON text, `{}` included.  Everything not
+    // registered above is here, and a caller reads it with its own
+    // decoder — see the module header for why this package does not
+    // ship a JSON value type of its own.
+    payload_json: Str
+
+// Empty claims: no issuer, no subject, no audience, no times.
+//
+// The starting point a caller builds from with the `with_*` functions
+// below.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     println("${list.len(jwtclaims.claims().aud)}")   // 0
+// ```
+pub fn claims() -> JwtClaims
+    todo("jwt-nv.jwtclaims.claims")
+
+// Claims with the issuer set.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     println(jwtclaims.with_iss(jwtclaims.claims(), "https://auth.example").iss)
+// ```
+pub fn with_iss(c: JwtClaims, iss: Str) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_iss")
+
+// Claims with the subject set.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     println(jwtclaims.with_sub(jwtclaims.claims(), "user-42").sub)
+// ```
+pub fn with_sub(c: JwtClaims, sub: Str) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_sub")
+
+// Claims with the audience set.
+//
+// A list, because RFC 7519 § 4.1.3 permits one string or an array and
+// a token with two audiences is a token a caller has to handle.  A
+// single-element list is emitted as a bare string, which is what every
+// other implementation expects to see.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     println("${list.len(jwtclaims.with_aud(jwtclaims.claims(), ["api"]).aud)}")
+// ```
+pub fn with_aud(c: JwtClaims, aud: [Str]) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_aud")
+
+// Claims that expire at an instant.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let now = jwtclaims.instant(1700000000)
+//     let c = jwtclaims.with_exp(jwtclaims.claims(), jwtclaims.plus(now, 3600))
+//     println("${jwtclaims.is_expired(c, now, 0)}")   // false
+// ```
+pub fn with_exp(c: JwtClaims, exp: JwtInstant) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_exp")
+
+// Claims not valid before an instant.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let now = jwtclaims.instant(1700000000)
+//     let c = jwtclaims.with_nbf(jwtclaims.claims(), jwtclaims.plus(now, 60))
+//     println("${jwtclaims.is_not_yet_valid(c, now, 0)}")   // true
+// ```
+pub fn with_nbf(c: JwtClaims, nbf: JwtInstant) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_nbf")
+
+// Claims issued at an instant.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let c = jwtclaims.with_iat(jwtclaims.claims(), jwtclaims.instant(1700000000))
+//     match c.iat
+//         Some(_) => println("issued")
+//         None    => println("no iat")
+// ```
+pub fn with_iat(c: JwtClaims, iat: JwtInstant) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_iat")
+
+// Claims with the token identifier set.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     println(jwtclaims.with_jti(jwtclaims.claims(), "1f2e3d").jti)
+// ```
+pub fn with_jti(c: JwtClaims, jti: Str) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_jti")
+
+// Claims carrying an application payload, as JSON object text.
+//
+// The registered claims above are merged INTO this object when the
+// token is encoded, so a `payload_json` that also spells `"exp"` has
+// its `exp` overwritten by the field — one source of truth for the
+// claims validation acts on, and no way for the two to disagree.
+//
+// `MalformedPayload` at encode time when the text is not a JSON
+// object.  It is checked rather than trusted because a token with a
+// broken payload is a token no verifier can read, and finding that out
+// at the issuer is much better than at the API gateway.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let c = jwtclaims.with_payload(jwtclaims.claims(), "{\"scope\":\"read\"}")
+//     println(c.payload_json)
+// ```
+pub fn with_payload(c: JwtClaims, payload_json: Str) -> JwtClaims
+    todo("jwt-nv.jwtclaims.with_payload")
+
+// Whether these claims are expired at an instant, allowing `leeway`
+// seconds of clock skew.
+//
+// `false` when there is no `exp` — a token without one does not
+// expire, which is a thing issuers do and a policy, not this
+// function, decides whether to accept.
+//
+// Public because a caller sometimes has to ask about a token it has
+// ALREADY verified: a session refreshed at the halfway point, a cache
+// deciding whether an entry is still good, a log line explaining why
+// a request was rejected.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let c = jwtclaims.with_exp(jwtclaims.claims(), jwtclaims.instant(100))
+//     println("${jwtclaims.is_expired(c, jwtclaims.instant(160), 0)}")    // true
+//     println("${jwtclaims.is_expired(c, jwtclaims.instant(160), 120)}")  // false
+// ```
+pub fn is_expired(c: JwtClaims, now: JwtInstant, leeway: Int) -> Bool
+    todo("jwt-nv.jwtclaims.is_expired")
+
+// Whether these claims are not yet valid at an instant, allowing
+// `leeway` seconds of clock skew.
+//
+// `false` when there is no `nbf`.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let c = jwtclaims.with_nbf(jwtclaims.claims(), jwtclaims.instant(200))
+//     println("${jwtclaims.is_not_yet_valid(c, jwtclaims.instant(100), 0)}")   // true
+// ```
+pub fn is_not_yet_valid(c: JwtClaims, now: JwtInstant, leeway: Int) -> Bool
+    todo("jwt-nv.jwtclaims.is_not_yet_valid")
+
+// Whether an audience is among these claims'.
+//
+// Exact string comparison, because RFC 7519 § 4.1.3 says the values
+// are case-sensitive strings the application agrees on, and a library
+// that normalised them would be guessing at somebody's identifier
+// scheme.  `false` for empty claims, so a token with no audience never
+// matches one a policy requires.
+//
+// ```novo
+// use jwtclaims
+//
+// fn main() [io]
+//     let c = jwtclaims.with_aud(jwtclaims.claims(), ["api", "admin"])
+//     println("${jwtclaims.has_audience(c, "admin")}")   // true
+// ```
+pub fn has_audience(c: JwtClaims, aud: Str) -> Bool
+    todo("jwt-nv.jwtclaims.has_audience")

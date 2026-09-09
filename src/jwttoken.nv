@@ -1,0 +1,434 @@
+// jwttoken.nv — the load-bearing interface: an unverified token whose
+// claims cannot be read.
+//
+// THE PROBLEM
+//
+// Every JWT library offers `decode(token)`, and it returns the claims.
+// The signature check is a separate call, or a flag, or a second
+// argument the caller may omit — and so the shortest path from a
+// string to a `sub` is the one that checks nothing.  That is not a
+// hypothetical failure: it is `jwt.decode(token, verify=False)` in
+// PyJWT, `jwt.decode` without `WithValidMethods` in Go, and the
+// long tail of CVEs where an application read a claim out of a token
+// it had not verified and trusted what it found.
+//
+// THE SHAPE
+//
+// There are two token types, and only one of them can be asked for
+// claims:
+//
+//     pub fn decode(token: Str) -> Result<UnverifiedJwt, JwtError>
+//     pub fn verify(t: UnverifiedJwt, key: JwtVerifyingKey,
+//                   policy: JwtPolicy, now: JwtInstant)
+//         -> Result<VerifiedJwt, JwtError>
+//     pub fn claims_of(t: VerifiedJwt) -> JwtClaims
+//
+// `claims_of` takes a `VerifiedJwt`.  There is no other way to obtain
+// a `JwtClaims` from a token, and there is no way to obtain a
+// `VerifiedJwt` except from `verify`.  So a caller holding claims has
+// necessarily been through a signature check with a key it chose and a
+// policy it wrote — not because it remembered to, but because the type
+// checker would not let it skip.  A code reviewer never has to ask
+// "was this verified"; the type says so.
+//
+// WHAT AN UNVERIFIED TOKEN WILL TELL YOU, AND WHY
+//
+// `header_of`, `alg_of` and `kid_of` work on an `UnverifiedJwt`, and
+// that is not a hole in the design.  Choosing WHICH key to verify with
+// requires reading the `kid`, so a token that showed nothing before
+// verification could never be verified at all.  Those three answer
+// with facts about the token's ENVELOPE — which key it claims to be
+// signed with — and nothing in this package lets a caller act on
+// them as claims about the world.  The header's `alg` in particular is
+// never used to select an algorithm: `verify` uses the KEY's, which is
+// what closes the algorithm-confusion attack.
+//
+// The claims are not available, at all, in any form, from an
+// `UnverifiedJwt`.  Not as a string, not as bytes, not "for logging".
+// A library that offered `unverified_claims()` for logging would find
+// it in an authorisation path within a year.
+//
+// THE ONE ESCAPE HATCH, NAMED SO IT CANNOT BE MISTAKEN
+//
+// `dangerous_unverified_payload_json` exists, because a small number
+// of real programs need it: a token introspection endpoint showing an
+// operator what a rejected token contained, a migration tool reading
+// tokens signed by a key it no longer has, a test fixture.  Refusing
+// outright would send those callers to a hand-rolled base64 split,
+// which is worse.  So it exists with a name no reviewer can miss in a
+// diff and no author can type by accident, it returns TEXT rather than
+// a `JwtClaims` — so it cannot be passed to anything that expects
+// verified claims — and its doc comment says what it must never be
+// used for.
+
+use jwtalg
+use jwtclaims
+use jwtpolicy
+
+// A token that has been decoded but NOT verified.
+//
+// It can tell you which key it claims to be signed with, and that is
+// all it can tell you.  `verify` is the only thing to do with one.
+//
+// ```novo
+// use jwttoken
+//
+// fn main() [io]
+//     match jwttoken.decode("eyJhbGciOiJIUzI1NiJ9.e30.sig")
+//         Ok(t)  => println(jwttoken.kid_of(t))
+//         Err(e) => println(e.message())
+// ```
+pub struct UnverifiedJwt
+    // The header, which is public because choosing a key needs it.
+    header: JwtHeader
+    // The `header.payload` text the signature covers, kept exactly as
+    // it arrived.  Re-serialising it would change the bytes and break
+    // every signature, which is the single most common way a JWT
+    // implementation goes wrong.
+    signing_input: Str
+    // The decoded signature bytes.
+    signature: Bytes
+    // The base64url payload segment, undecoded.  Private: this is
+    // where the claims are, and the type not exposing it is the whole
+    // design.  `dangerous_unverified_payload_json` is the one door,
+    // and it is named to be seen.
+    payload_b64: Str
+
+// A token whose signature has been checked with a key the caller
+// chose, against a policy the caller wrote.
+//
+// The only type `claims_of` accepts, and the only thing `verify`
+// produces.  A value of this type in a program is a proof that a
+// signature check happened.
+//
+// ```novo
+// use jwttoken
+// use jwtclaims
+//
+// fn main() [io]
+//     println("a VerifiedJwt can only come from verify()")
+// ```
+pub struct VerifiedJwt
+    // The header the signature covered.
+    header: JwtHeader
+    // The claims.  Reachable only through `claims_of`, and only from
+    // this type.
+    claims: JwtClaims
+    // Which algorithm actually verified it — the KEY's, not the
+    // header's.  They are equal by the time this exists, because a
+    // mismatch is `AlgorithmMismatch`; the field records which one it
+    // was for a caller logging what happened.
+    verified_with: JwtAlg
+
+// Split a compact-serialisation token into its parts.
+//
+// Checks the SHAPE and nothing about trust: three base64url segments
+// separated by dots, a header that is a JSON object naming an
+// algorithm this package implements, a decodable signature.  It does
+// not touch the payload, and it does not look at a key.
+//
+// A header with `"alg": "none"` fails here with `UnknownAlgorithm`,
+// because `JwtAlg` has no such arm — the famous vulnerability is
+// closed by the type, not by a check that a refactor could remove.
+// A non-empty `crit` header fails with `UnsupportedCritical`, because
+// RFC 7515 § 4.1.11 requires a verifier to refuse extensions it does
+// not understand and this package understands none.
+//
+// ```novo
+// use jwttoken
+//
+// fn main() [io]
+//     match jwttoken.decode("not.a.jwt")
+//         Ok(_)  => println("decoded")
+//         Err(e) => println(e.message())
+// ```
+pub fn decode(token: Str) -> Result<UnverifiedJwt, JwtError>
+    todo("jwt-nv.jwttoken.decode")
+
+// THE LOAD-BEARING FUNCTION.  Check the signature and the policy, and
+// produce the only value from which claims can be read.
+//
+// In order, and the order matters:
+//
+//  1. the key's algorithm against the header's — a mismatch is
+//     `AlgorithmMismatch`, which is what stops a token signed HS256
+//     with an RSA public key being accepted by an RS256 verifier;
+//  2. the key's algorithm against the policy's allowed list —
+//     `AlgorithmNotAllowed`, so a deployment that has retired HS256
+//     stops accepting it even where a key still exists;
+//  3. the SIGNATURE, in constant time;
+//  4. and only then `exp`, `nbf`, `iss` and `aud`.
+//
+// The claims are parsed after step 3 and never before, so a token that
+// fails its signature has never had its payload interpreted — a
+// malformed payload behind a bad signature cannot reach the JSON
+// decoder at all.
+//
+// `now` is a parameter because this package is `core` and may not read
+// a clock; see `jwtclaims`' module header.  The `[time]` is spent in
+// the caller, once, where it is visible — and the by-product is that a
+// test can verify at any instant and an audit tool can ask "was this
+// valid when it was presented".
+//
+// ```novo
+// use jwttoken
+// use jwtalg
+// use jwtclaims
+// use jwtpolicy
+//
+// fn check(token: Str, secret: Bytes, now_seconds: Int) -> Result<JwtClaims, JwtError>
+//     let t   = jwttoken.decode(token)!
+//     let key = jwtalg.hmac_verifying_key(secret)
+//     let pol = jwtpolicy.requiring(jwtpolicy.strict(), "https://auth.example", "api")
+//     Ok(jwttoken.claims_of(jwttoken.verify(t, key, pol, jwtclaims.instant(now_seconds))!))
+//
+// fn main() [io]
+//     match check("eyJhbGciOiJIUzI1NiJ9.e30.sig",
+//                 bytes.from_str("a-32-byte-secret-for-hs256-here!"), 1700000000)
+//         Ok(c)  => println(c.sub)
+//         Err(e) => println(e.message())
+// ```
+pub fn verify(t: UnverifiedJwt, key: JwtVerifyingKey, policy: JwtPolicy,
+              now: JwtInstant) -> Result<VerifiedJwt, JwtError>
+    todo("jwt-nv.jwttoken.verify")
+
+// `verify` against a set of keys, choosing by the token's `kid`.
+//
+// The convenience for a caller holding a rotated key set, and it makes
+// exactly one decision on the caller's behalf: which key to try.
+// `NoMatchingKey` when the `kid` matches none, and — importantly —
+// `NoMatchingKey` rather than a scan when the token has NO `kid` and
+// more than one key is offered, because trying each key in turn is how
+// a retired key gets used for another year.
+//
+// ```novo
+// use jwttoken
+// use jwtalg
+// use jwtclaims
+// use jwtpolicy
+//
+// fn main() [io]
+//     let keys = [jwtalg.with_kid(jwtalg.rsa_verifying_key(bytes.from_str("<der>")), "k1")]
+//     match jwttoken.decode("eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.e30.sig")
+//         Ok(t) =>
+//             match jwttoken.verify_with_keys(t, keys, jwtpolicy.strict(),
+//                                             jwtclaims.instant(1700000000))
+//                 Ok(_)  => println("verified")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn verify_with_keys(t: UnverifiedJwt, keys: [JwtVerifyingKey], policy: JwtPolicy,
+                        now: JwtInstant) -> Result<VerifiedJwt, JwtError>
+    todo("jwt-nv.jwttoken.verify_with_keys")
+
+// The claims of a verified token.
+//
+// THE ONLY WAY TO OBTAIN A `JwtClaims` FROM A TOKEN, and it takes a
+// `VerifiedJwt`, which only `verify` produces.  That is the whole
+// safety property of this package, stated as a signature.
+//
+// It is total — no `Result` — because by the time a `VerifiedJwt`
+// exists the payload has been parsed and the policy has passed.
+// Everything that could fail has already failed.
+//
+// ```novo
+// use jwttoken
+//
+// fn main() [io]
+//     println("claims_of takes a VerifiedJwt, and nothing else produces one")
+// ```
+pub fn claims_of(t: VerifiedJwt) -> JwtClaims
+    todo("jwt-nv.jwttoken.claims_of")
+
+// The header of a verified token.
+//
+// ```novo
+// use jwttoken
+//
+// fn main() [io]
+//     println("the header the signature actually covered")
+// ```
+pub fn verified_header_of(t: VerifiedJwt) -> JwtHeader
+    todo("jwt-nv.jwttoken.verified_header_of")
+
+// Which algorithm verified this token — the KEY's, which is the only
+// one that means anything.
+//
+// For a caller logging what happened, or counting how much of its
+// traffic still arrives on an algorithm it wants to retire.
+//
+// ```novo
+// use jwttoken
+// use jwtalg
+//
+// fn main() [io]
+//     println("verified_alg_of reports the key's algorithm, not the header's")
+// ```
+pub fn verified_alg_of(t: VerifiedJwt) -> JwtAlg
+    todo("jwt-nv.jwttoken.verified_alg_of")
+
+// The header of an unverified token.
+//
+// Available before verification because CHOOSING A KEY REQUIRES IT: a
+// token that showed nothing could never be verified.  What it returns
+// is a fact about the token's envelope — which key it claims to be
+// signed with — and not a claim about the world.
+//
+// ```novo
+// use jwttoken
+//
+// fn main() [io]
+//     match jwttoken.decode("eyJhbGciOiJIUzI1NiJ9.e30.sig")
+//         Ok(t)  => println(t.header.typ)
+//         Err(_) => println("not a token")
+// ```
+pub fn header_of(t: UnverifiedJwt) -> JwtHeader
+    todo("jwt-nv.jwttoken.header_of")
+
+// The algorithm an unverified token's header names.
+//
+// A ROUTING HINT, never an instruction.  `verify` uses the KEY's
+// algorithm and refuses a token whose header disagrees; this is here
+// so a caller can pick the right key from a set that holds several
+// kinds, and so a metric can count what is arriving.
+//
+// ```novo
+// use jwttoken
+// use jwtalg
+//
+// fn main() [io]
+//     match jwttoken.decode("eyJhbGciOiJIUzI1NiJ9.e30.sig")
+//         Ok(t)  => println(jwtalg.alg_name(jwttoken.alg_of(t)))
+//         Err(_) => println("not a token")
+// ```
+pub fn alg_of(t: UnverifiedJwt) -> JwtAlg
+    todo("jwt-nv.jwttoken.alg_of")
+
+// The key identifier an unverified token's header names, or `""`.
+//
+// The other half of key selection, and the reason the header is
+// readable at all.
+//
+// ```novo
+// use jwttoken
+//
+// fn main() [io]
+//     match jwttoken.decode("eyJhbGciOiJIUzI1NiJ9.e30.sig")
+//         Ok(t)  => println(jwttoken.kid_of(t))
+//         Err(_) => println("not a token")
+// ```
+pub fn kid_of(t: UnverifiedJwt) -> Str
+    todo("jwt-nv.jwttoken.kid_of")
+
+// **The payload of a token nobody has verified. Never make an
+// authorisation decision with this.**
+//
+// The one escape hatch in this package, and it is named so that no
+// reviewer can miss it in a diff and no author can type it by
+// accident. It returns the payload as JSON TEXT and not as a
+// `JwtClaims`, so the result cannot be passed to anything that expects
+// verified claims — the type system keeps the two apart even here.
+//
+// It exists because a small number of real programs need it and the
+// alternative is worse. A token introspection endpoint showing an
+// operator what a rejected token contained; a migration tool reading
+// tokens signed with a key that has been destroyed; a test fixture.
+// Refusing outright would send those callers to a hand-rolled base64
+// split, which has no `crit` check, no algorithm check, and no name a
+// reviewer would notice.
+//
+// What comes back is attacker-controlled text. It has not been checked
+// against a signature, a key, an issuer, an audience, or a clock. An
+// attacker chooses every byte of it. Log it, display it, count it —
+// and decide nothing on it.
+//
+// ```novo
+// use jwttoken
+//
+// fn explain_rejection(token: Str) -> Str
+//     match jwttoken.decode(token)
+//         Ok(t)  => jwttoken.dangerous_unverified_payload_json(t)
+//         Err(_) => "{}"
+//
+// fn main() [io]
+//     println(explain_rejection("eyJhbGciOiJIUzI1NiJ9.e30.sig"))
+// ```
+pub fn dangerous_unverified_payload_json(t: UnverifiedJwt) -> Str
+    todo("jwt-nv.jwttoken.dangerous_unverified_payload_json")
+
+// Sign a header and claims into a compact-serialisation token.
+//
+// The header's algorithm is taken from the KEY, not from the header
+// argument — a caller cannot construct a token whose header says one
+// thing and whose signature is another, which would be a token no
+// verifier could accept and a bug that only shows up in production.
+//
+// `WeakKey` when an HS256 secret is shorter than the 32 bytes RFC 7518
+// § 3.2 requires: refusing is better than signing with a secret that
+// can be brute-forced, and doing it at the signing end means the
+// tokens never exist.
+//
+// ```novo
+// use jwttoken
+// use jwtalg
+// use jwtclaims
+//
+// fn issue(secret: Bytes, now_seconds: Int) -> Result<Str, JwtError>
+//     let now = jwtclaims.instant(now_seconds)
+//     let c   = jwtclaims.with_exp(
+//                   jwtclaims.with_sub(jwtclaims.claims(), "user-42"),
+//                   jwtclaims.plus(now, 3600))
+//     jwttoken.encode(jwtclaims.header(Hs256), c, jwtalg.hmac_key(secret))
+//
+// fn main() [io]
+//     match issue(bytes.from_str("a-32-byte-secret-for-hs256-here!"), 1700000000)
+//         Ok(s)  => println(s)
+//         Err(e) => println(e.message())
+// ```
+pub fn encode(h: JwtHeader, c: JwtClaims, key: JwtSigningKey) -> Result<Str, JwtError>
+    todo("jwt-nv.jwttoken.encode")
+
+// The `header.payload` text a signature covers, for a caller doing its
+// own signing.
+//
+// It is here for the case this package cannot serve directly: a key in
+// a hardware module, a KMS, a smartcard — where the private key never
+// leaves the device and the signing is somebody else's `[net]` or
+// `[hw]` call. That caller builds the signing input here, has it
+// signed elsewhere, and assembles the token with `attach_signature`.
+//
+// The alternative would be for this package to take a signing
+// CALLBACK, which would make a `core` function's cost depend on a
+// closure's, and the sans-IO answer is to hand the caller the bytes
+// and let it perform.
+//
+// ```novo
+// use jwttoken
+// use jwtclaims
+// use jwtalg
+//
+// fn main() [io]
+//     match jwttoken.signing_input(jwtclaims.header(Es256), jwtclaims.claims())
+//         Ok(s)  => println(s)
+//         Err(e) => println(e.message())
+// ```
+pub fn signing_input(h: JwtHeader, c: JwtClaims) -> Result<Str, JwtError>
+    todo("jwt-nv.jwttoken.signing_input")
+
+// A token from a signing input and a signature produced elsewhere.
+//
+// The other half of the external-signer path. The signature is
+// base64url-encoded and appended; it is NOT checked here, because the
+// caller that just produced it is the party that knows whether it is
+// right, and a check would need the public key this function was not
+// given.
+//
+// ```novo
+// use jwttoken
+//
+// fn main() [io]
+//     println(jwttoken.attach_signature("eyJhbGciOiJFUzI1NiJ9.e30",
+//                                       bytes.zeros(64)))
+// ```
+pub fn attach_signature(signing_input: Str, signature: Bytes) -> Str
+    todo("jwt-nv.jwttoken.attach_signature")

@@ -1,0 +1,138 @@
+// jwtpolicy_tests.nv — the API suite for validation as a value.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// jwt-nv.jwtpolicy.<fn>`.  What is asserted is that every default
+// refuses, that narrowing is explicit, and that a policy which could
+// never accept anything says so at start-up rather than per request.
+
+use std.test
+use jwtpolicy
+use jwterror
+
+@test
+fn test_the_strict_policy_accepts_nothing_until_it_is_told_to() [io]
+    // The awkwardness is the design.  Every library that ships
+    // `verify(token, key, audience=None, verify_aud=False, …)` has put
+    // a security decision in a default argument written by someone who
+    // is not the person deploying the service.
+    let p = jwtpolicy.strict()
+
+    test.case("no algorithms, so it could not verify anything yet")
+    test.assert(list.len(p.allowed_algs) == 0)
+
+    test.case("an issuer and an audience are required, and unset")
+    test.assert(p.require_iss)
+    test.assert(p.require_aud)
+    test.assert(p.issuer == "")
+    test.assert(p.audience == "")
+
+    test.case("an expiry is required — a token that never expires cannot be revoked")
+    test.assert(p.require_exp)
+
+    test.case("no clock skew is assumed")
+    test.assert(p.leeway_seconds == 0)
+
+    test.case("and `nbf` and `sub` are not required, because most issuers omit them")
+    test.assert(not p.require_nbf)
+    test.assert(not p.require_sub)
+
+@test
+fn test_an_unusable_policy_says_so_before_a_request_arrives() [io]
+    // A policy with no algorithms and a policy missing the issuer it
+    // requires are CONFIGURATION mistakes.  Finding them at start-up,
+    // where the message can name the field, is worth much more than
+    // finding them per request as a stream of rejections that all look
+    // like a client's fault.
+    test.case("strict() alone accepts nothing, and check says which fault")
+    match jwtpolicy.check(jwtpolicy.strict())
+        Some(PolicyAcceptsNothing) => test.assert(true)
+        Some(_)                    => test.fail("wrong reason for a policy with no algorithms")
+        None                       => test.fail("a policy with no algorithms accepts nothing")
+
+    test.case("a policy requiring an issuer it does not name is incomplete")
+    let algs_only = jwtpolicy.allowing(jwtpolicy.strict(), [Hs256])
+    match jwtpolicy.check(algs_only)
+        Some(PolicyIncomplete(field)) => test.assert(field == "issuer")
+        Some(_)                       => test.fail("wrong reason for an unnamed issuer")
+        None                          => test.fail("require_iss with issuer == \"\" is incomplete")
+
+    test.case("a fully narrowed policy is usable")
+    let ready = jwtpolicy.requiring(algs_only, "https://auth.example", "api")
+    match jwtpolicy.check(ready)
+        Some(_) => test.fail("this policy names everything it requires")
+        None    => test.assert(true)
+
+    test.case("and both faults are the service's, not a client's")
+    test.assert(jwterror.is_configuration_fault(PolicyAcceptsNothing))
+    test.assert(jwterror.is_configuration_fault(PolicyIncomplete("issuer")))
+    test.assert(not jwterror.is_client_safe(PolicyAcceptsNothing))
+
+@test
+fn test_the_algorithm_list_is_where_retirement_happens() [io]
+    // One edit in one place: a deployment that has moved off HS256
+    // drops it here and stops accepting it everywhere, even where a
+    // key still exists in a config file somebody forgot.
+    let p = jwtpolicy.allowing(jwtpolicy.strict(), [Rs256, Es256])
+
+    test.case("the named algorithms are accepted")
+    test.assert(jwtpolicy.accepts_alg(p, Rs256))
+    test.assert(jwtpolicy.accepts_alg(p, Es256))
+
+    test.case("and the one not named is not, whatever keys exist")
+    test.assert(not jwtpolicy.accepts_alg(p, Hs256))
+
+    test.case("the base policy is untouched — the value is copied, not edited")
+    test.assert(not jwtpolicy.accepts_alg(jwtpolicy.strict(), Rs256))
+
+@test
+fn test_the_permissive_policy_still_honours_an_expiry_that_is_there() [io]
+    // It drops the requirements; it does not accept an expired token,
+    // because accepting one is never what anybody means.
+    let p = jwtpolicy.permissive()
+
+    test.case("no issuer, no audience, no required expiry")
+    test.assert(not p.require_iss)
+    test.assert(not p.require_aud)
+    test.assert(not p.require_exp)
+
+    test.case("but all three algorithms, so an introspection tool can read any token")
+    test.assert(jwtpolicy.accepts_alg(p, Hs256))
+    test.assert(jwtpolicy.accepts_alg(p, Rs256))
+    test.assert(jwtpolicy.accepts_alg(p, Es256))
+
+    test.case("and it is usable as it stands, unlike strict()")
+    match jwtpolicy.check(p)
+        Some(_) => test.fail("permissive() requires nothing it has not got")
+        None    => test.assert(true)
+
+@test
+fn test_requiring_sets_the_pair_that_answers_is_this_token_for_me() [io]
+    test.case("the issuer and the audience together")
+    let p = jwtpolicy.requiring(jwtpolicy.strict(), "https://auth.example", "api")
+    test.assert(p.issuer == "https://auth.example")
+    test.assert(p.audience == "api")
+
+    test.case("and the requirements they satisfy stay on")
+    test.assert(p.require_iss)
+    test.assert(p.require_aud)
+
+@test
+fn test_the_remaining_narrowings_each_change_one_thing() [io]
+    let p = jwtpolicy.strict()
+
+    test.case("with_leeway")
+    test.assert(jwtpolicy.with_leeway(p, 30).leeway_seconds == 30)
+
+    test.case("with_max_lifetime caps a credential nobody can revoke")
+    test.assert(jwtpolicy.with_max_lifetime(p, 3600).max_lifetime_seconds == 3600)
+    test.assert(p.max_lifetime_seconds == 0)
+
+    test.case("requiring_subject and requiring_nbf")
+    test.assert(jwtpolicy.requiring_subject(p).require_sub)
+    test.assert(jwtpolicy.requiring_nbf(p).require_nbf)
+
+    test.case("and each leaves everything else alone")
+    let one = jwtpolicy.with_leeway(p, 30)
+    test.assert(one.require_exp == p.require_exp)
+    test.assert(one.require_aud == p.require_aud)
+    test.assert(one.max_lifetime_seconds == p.max_lifetime_seconds)

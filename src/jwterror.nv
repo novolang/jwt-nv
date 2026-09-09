@@ -1,0 +1,193 @@
+// jwterror.nv — every way a token can be refused, and what a caller
+// may safely tell the client about it.
+//
+// THE REASONS ARE SEPARATE BECAUSE THE FIXES ARE
+//
+// "Invalid token" is what an API should usually SAY, and it is a
+// terrible thing for a library to RETURN, because the four things it
+// covers have four different responses: an expired token means refresh
+// and retry, a wrong audience means the client is talking to the wrong
+// service, a bad signature means somebody is attacking or a key has
+// rotated, and a malformed token means the client's serialiser is
+// broken.  A caller that cannot tell them apart cannot do any of it —
+// so the reasons are separate here, and `is_client_safe` is what says
+// which of them may be repeated back over the wire.
+//
+// WHAT MAY BE SAID OUT LOUD
+//
+// `is_client_safe` divides the reasons in two.  Expiry, not-yet-valid,
+// a wrong audience and a malformed token are facts the presenter of
+// the token already knows, so telling them costs nothing and saves a
+// support ticket.  A signature failure, an algorithm mismatch and a
+// missing key are not: they distinguish "your token is old" from "your
+// forgery was detected", which is exactly the oracle an attacker wants
+// while probing.  Those get a flat rejection over the wire and the
+// detail in the log.
+//
+// A library cannot enforce that division — the caller writes the
+// response — so this is the one function that makes it cheap to get
+// right, and the doc comments say which side each arm is on.
+
+// Why a token was refused.
+//
+// ```novo
+// use jwterror
+//
+// fn main() [io]
+//     println(Expired(1700003600, 1700007200).message())
+// ```
+pub enum JwtError
+    // The token is not three base64url segments separated by dots, or
+    // a segment does not decode.  CLIENT-SAFE: the presenter's
+    // serialiser is broken and telling it so is the fix.
+    Malformed(why: Str)
+    // The header or the payload is not a JSON object.  `which` is
+    // `"header"` or `"payload"`.  CLIENT-SAFE.
+    MalformedPayload(which: Str)
+    // The header's `alg` is not one this package implements — and
+    // `"none"` arrives here, because `JwtAlg` has no such arm.  The
+    // name is carried so a log can show what was attempted, which for
+    // `none` is an attack worth counting.  CLIENT-SAFE: the presenter
+    // knows what it signed with.
+    UnknownAlgorithm(name: Str)
+    // The header's `crit` names extensions this package does not
+    // understand.  RFC 7515 § 4.1.11 requires refusing rather than
+    // ignoring, because ignoring is how a security-relevant extension
+    // gets skipped.  CLIENT-SAFE.
+    UnsupportedCritical(names: [Str])
+    // The token's header names one algorithm and the verifying key is
+    // for another.  THE ALGORITHM-CONFUSION REFUSAL: a token signed
+    // HS256 with an RSA public key as the secret lands here.  NOT
+    // client-safe — it tells an attacker its substitution was
+    // detected.
+    AlgorithmMismatch(header_alg: Str, key_alg: Str)
+    // The key's algorithm is not in the policy's allowed list.  NOT
+    // client-safe: a deployment's algorithm list is not the
+    // presenter's business.
+    AlgorithmNotAllowed(alg: Str)
+    // The signature does not check out.  NOT client-safe, and the one
+    // that matters most: a caller that tells a client "bad signature"
+    // rather than "invalid token" has built a forgery oracle.
+    BadSignature
+    // No key in the set matched the token's `kid`, or the token had
+    // none and more than one key was offered.  NOT client-safe: which
+    // key identifiers a service holds is not the presenter's
+    // business.
+    NoMatchingKey(kid: Str)
+    // An HS256 key is shorter than the 32 bytes RFC 7518 § 3.2
+    // requires.  A fault in the SERVICE's configuration rather than
+    // in the token, and it is refused at signing as well as at
+    // verifying so the tokens never exist.  NOT client-safe.
+    WeakKey(bytes_given: Int, bytes_required: Int)
+    // The token expired.  `at` and `now` are both carried, in Unix
+    // seconds, because the useful message is "expired 40 minutes ago"
+    // and a caller cannot compute it from one of them.  CLIENT-SAFE:
+    // the presenter knows when its token expires, and telling it is
+    // what triggers a refresh instead of a retry loop.
+    Expired(at: Int, now: Int)
+    // The token's `nbf` is in the future.  CLIENT-SAFE, and usually a
+    // clock-skew problem the policy's leeway should have covered.
+    NotYetValid(at: Int, now: Int)
+    // The token's issuer is not the one the policy requires.  NOT
+    // client-safe: which issuers a service trusts is not the
+    // presenter's business.
+    WrongIssuer(want: Str, got: Str)
+    // The token's audience does not include the one the policy
+    // requires.  CLIENT-SAFE: the presenter is talking to the wrong
+    // service and needs to be told which one it asked for a token
+    // for.
+    WrongAudience(want: Str)
+    // A claim the policy requires is absent.  `name` is the claim.
+    // CLIENT-SAFE.
+    MissingClaim(name: Str)
+    // The token's `exp - iat` exceeds the policy's cap.  NOT
+    // client-safe: a gateway's lifetime cap is a deployment decision.
+    LifetimeTooLong(seconds: Int, max_seconds: Int)
+    // The policy allows no algorithms, so it could never accept
+    // anything.  A configuration fault found by `jwtpolicy.check`,
+    // ideally at start-up.  NOT client-safe.
+    PolicyAcceptsNothing
+    // The policy requires an issuer or an audience it does not name.
+    // `field` says which.  Also a start-up fault.  NOT client-safe.
+    PolicyIncomplete(field: Str)
+
+// `JwtError` is an `Error`, which is what lets `Result<T, JwtError>`
+// exist at all (SPEC § 3.4).
+impl Error for JwtError
+    // The one-line message, for a LOG.
+    //
+    // It says what actually happened — "the signature did not verify",
+    // "the token expired 2400 seconds ago" — because that is what an
+    // operator reading a log needs.  It is NOT the string to send to a
+    // client: `is_client_safe` is the function for that decision, and
+    // several of these messages would be an oracle if repeated over
+    // the wire.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("jwt-nv.JwtError.message")
+
+// Whether this reason may be repeated to whoever presented the token.
+//
+// True for the reasons the presenter already knows — expiry,
+// not-yet-valid, a wrong audience, a malformed token, an algorithm it
+// chose itself.  False for the ones that would tell an attacker
+// whether a forgery was detected: `BadSignature`, `AlgorithmMismatch`,
+// `NoMatchingKey`, `WrongIssuer`, and every configuration fault.
+//
+// A library cannot enforce the division, because the caller writes the
+// response.  This is the function that makes getting it right one line:
+//
+// ```novo
+// use jwterror
+//
+// fn client_message(e: JwtError) -> Str
+//     if jwterror.is_client_safe(e)
+//         e.message()
+//     else
+//         "invalid token"
+//
+// fn main() [io]
+//     println(client_message(BadSignature))     // invalid token
+//     println(client_message(Expired(100, 200)))
+// ```
+pub fn is_client_safe(e: JwtError) -> Bool
+    todo("jwt-nv.jwterror.is_client_safe")
+
+// Whether this reason is a fault in the SERVICE's configuration rather
+// than in the token.
+//
+// True for `PolicyAcceptsNothing`, `PolicyIncomplete` and `WeakKey`.
+// Those three are not a client's problem at all: they mean the service
+// was deployed wrong, they will fail identically for every request,
+// and a service that answered 401 to them would look to its operators
+// like an authentication outage rather than a misconfiguration.  The
+// right response is a 500 and a loud log — and this is what tells the
+// two apart.
+//
+// ```novo
+// use jwterror
+//
+// fn main() [io]
+//     println("${jwterror.is_configuration_fault(PolicyAcceptsNothing)}")   // true
+//     println("${jwterror.is_configuration_fault(Expired(1, 2))}")          // false
+// ```
+pub fn is_configuration_fault(e: JwtError) -> Bool
+    todo("jwt-nv.jwterror.is_configuration_fault")
+
+// A short stable code for metrics and logs: `"expired"`,
+// `"bad_signature"`, `"wrong_audience"`, and so on.
+//
+// Stable across releases and free of anything a token carried, so it
+// is safe as a metric label — putting `e.message()` in one would put
+// an attacker-chosen issuer string into a time series database, which
+// is a cardinality explosion and an injection at the same time.
+//
+// ```novo
+// use jwterror
+//
+// fn main() [io]
+//     println(jwterror.code(BadSignature))      // bad_signature
+// ```
+pub fn code(e: JwtError) -> Str
+    todo("jwt-nv.jwterror.code")

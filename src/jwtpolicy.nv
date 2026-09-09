@@ -1,0 +1,262 @@
+// jwtpolicy.nv — validation as one value, not a pile of optional
+// arguments.
+//
+// THE PROBLEM WITH THE PILE
+//
+// Every JWT library ends up with a verify function like
+//
+//     verify(token, key, audience=None, issuer=None, leeway=0,
+//            algorithms=None, verify_exp=True, verify_aud=False, …)
+//
+// and every one of those defaults is a security decision made by
+// someone who is not the person deploying the service.  `verify_aud`
+// defaulting to false is why tokens get accepted across services;
+// `algorithms=None` meaning "whatever the token says" is the
+// algorithm-confusion attack in a default argument.  And because they
+// are arguments, they are written once at each call site, so the
+// twelfth call site in a codebase has drifted from the first and
+// nobody can tell by looking.
+//
+// So validation here is a VALUE.  A service builds one, names it, and
+// hands the same one to every verification it does — so "what does
+// this service accept" is a thing with a definition, a place in the
+// source, and a diff when it changes.
+//
+// EVERY DEFAULT REFUSES
+//
+// `strict()` requires an expiry, requires an issuer match, requires an
+// audience match, and allows no algorithms at all.  A caller must fill
+// those in before it can verify anything.  That is deliberately
+// awkward: the awkwardness is a decision being made rather than
+// inherited, and it is the one moment at which somebody looks at what
+// their service accepts.
+//
+// `permissive()` exists for the cases where that is genuinely wrong —
+// an introspection tool, a test — and its name is what it is so that
+// nobody reaches for it without noticing.
+
+// What a verifier will accept.
+//
+// Built from `strict()` and narrowed — or, rarely and visibly, from
+// `permissive()`.  Carried by value: two services in one program hold
+// different policies and neither can change the other's.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     println("${jwtpolicy.strict().require_exp}")   // true
+// ```
+pub struct JwtPolicy
+    // The algorithms this policy accepts.  EMPTY in `strict()`, so a
+    // caller must name what it takes before it can verify anything —
+    // which is what stops "whatever the token says" from ever being
+    // the behaviour.  `verify` checks the KEY's algorithm against
+    // this, never the header's.
+    allowed_algs: [JwtAlg]
+    // The issuer a token must claim, or `""` for "any".  `strict()`
+    // sets `require_iss`, so `""` there is a refusal rather than a
+    // wildcard.
+    issuer: Str
+    // Whether an `iss` match is required.  `true` in `strict()`.
+    require_iss: Bool
+    // The audience a token must be for, or `""`.
+    audience: Str
+    // Whether an `aud` match is required.  `true` in `strict()`.  It
+    // is the default most libraries get wrong, and getting it wrong
+    // is why a token minted for one service is accepted by another.
+    require_aud: Bool
+    // Whether a token must carry an `exp`.  `true` in `strict()`: a
+    // token that never expires is a credential that cannot be
+    // revoked, and accepting one should be a decision.
+    require_exp: Bool
+    // Whether a token must carry an `nbf`.  `false` in `strict()` —
+    // most issuers do not set one and requiring it would reject
+    // ordinary tokens.  The `nbf` that IS present is always honoured.
+    require_nbf: Bool
+    // Whether a token must carry a `sub`.  `false` in `strict()`:
+    // plenty of legitimate tokens are about a service rather than a
+    // person.
+    require_sub: Bool
+    // Seconds of clock skew allowed on `exp` and `nbf`.  `0` in
+    // `strict()`.  A distributed system with unsynchronised clocks
+    // needs a few seconds here, and it should say how many.
+    leeway_seconds: Int
+    // The largest `exp - iat` this policy will accept, or `0` for no
+    // bound.  `0` in `strict()`.  It is here because a token with a
+    // ten-year lifetime passes every other check and is still a
+    // credential nobody can revoke; a gateway that wants to cap what
+    // its issuers hand out has nowhere else to say so.
+    max_lifetime_seconds: Int
+
+// The policy that refuses everything until told otherwise: no
+// algorithms, an issuer and an audience required and unset, an expiry
+// required, no leeway.
+//
+// A caller MUST narrow it before it can verify — `allowing` and
+// `requiring` are how — and the awkwardness is the point: it is the
+// one moment at which somebody looks at what their service accepts.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     let p = jwtpolicy.strict()
+//     println("${list.len(p.allowed_algs)}")    // 0 — nothing is accepted yet
+//     println("${p.require_aud}")               // true
+// ```
+pub fn strict() -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.strict")
+
+// **A policy that checks the signature and almost nothing else.**
+//
+// No issuer, no audience, no required expiry — an `exp` that IS
+// present is still honoured, because accepting an expired token is
+// never what anybody means. All three algorithms allowed.
+//
+// It is for a token introspection tool, a test that does not care, or
+// a migration reading tokens whose issuer is long gone. It is not for
+// an API gateway, and the name is what it is so that a reviewer seeing
+// it in a request path asks why.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     println("${jwtpolicy.permissive().require_aud}")   // false
+// ```
+pub fn permissive() -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.permissive")
+
+// A policy that accepts these algorithms and no others.
+//
+// The list is the KEY's algorithms, checked against the key a caller
+// supplies. It is here as well as on the key so that retiring an
+// algorithm is one edit in one place: a deployment that has moved off
+// HS256 drops it here and stops accepting it everywhere, even where a
+// key still exists in a config file somebody forgot.
+//
+// ```novo
+// use jwtpolicy
+// use jwtalg
+//
+// fn main() [io]
+//     let p = jwtpolicy.allowing(jwtpolicy.strict(), [Rs256, Es256])
+//     println("${list.len(p.allowed_algs)}")    // 2
+// ```
+pub fn allowing(p: JwtPolicy, algs: [JwtAlg]) -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.allowing")
+
+// A policy requiring this issuer and this audience.
+//
+// The two together because they are the pair that answers "is this
+// token for me, from someone I trust", and a policy with one and not
+// the other is nearly always a mistake somebody made halfway through.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     let p = jwtpolicy.requiring(jwtpolicy.strict(), "https://auth.example", "api")
+//     println(p.issuer)                         // https://auth.example
+//     println(p.audience)                       // api
+// ```
+pub fn requiring(p: JwtPolicy, issuer: Str, audience: Str) -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.requiring")
+
+// A policy allowing this many seconds of clock skew on `exp` and
+// `nbf`.
+//
+// A distributed system with unsynchronised clocks needs a few, and it
+// should say how many rather than inheriting a library's guess.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     println("${jwtpolicy.with_leeway(jwtpolicy.strict(), 30).leeway_seconds}")
+// ```
+pub fn with_leeway(p: JwtPolicy, seconds: Int) -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.with_leeway")
+
+// A policy capping how long a token may have been minted for.
+//
+// `exp - iat`, in seconds; `0` for no cap. A token with a ten-year
+// lifetime passes every other check and is still a credential nobody
+// can revoke, and a gateway that wants to bound what its issuers hand
+// out has nowhere else to say so. `MissingClaim` when the cap is set
+// and the token has no `iat`, because the check cannot be made
+// without one and silently skipping it would make the cap decorative.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     let p = jwtpolicy.with_max_lifetime(jwtpolicy.strict(), 3600)
+//     println("${p.max_lifetime_seconds}")      // 3600
+// ```
+pub fn with_max_lifetime(p: JwtPolicy, seconds: Int) -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.with_max_lifetime")
+
+// A policy that also requires a subject.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     println("${jwtpolicy.requiring_subject(jwtpolicy.strict()).require_sub}")
+// ```
+pub fn requiring_subject(p: JwtPolicy) -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.requiring_subject")
+
+// A policy that also requires a `nbf`.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     println("${jwtpolicy.requiring_nbf(jwtpolicy.strict()).require_nbf}")
+// ```
+pub fn requiring_nbf(p: JwtPolicy) -> JwtPolicy
+    todo("jwt-nv.jwtpolicy.requiring_nbf")
+
+// Whether this policy accepts an algorithm.
+//
+// Public so a caller can check its own configuration before a request
+// arrives — a service starting up can assert that the policy it built
+// accepts the keys it loaded, rather than finding out at the first
+// 401.
+//
+// ```novo
+// use jwtpolicy
+// use jwtalg
+//
+// fn main() [io]
+//     let p = jwtpolicy.allowing(jwtpolicy.strict(), [Rs256])
+//     println("${jwtpolicy.accepts_alg(p, Rs256)}")   // true
+//     println("${jwtpolicy.accepts_alg(p, Hs256)}")   // false
+// ```
+pub fn accepts_alg(p: JwtPolicy, a: JwtAlg) -> Bool
+    todo("jwt-nv.jwtpolicy.accepts_alg")
+
+// Whether this policy could ever accept anything, and why not.
+//
+// `Some(PolicyAcceptsNothing)` for a policy with no allowed
+// algorithms, and `Some(PolicyIncomplete)` for one that requires an
+// issuer or an audience it does not name. `None` when it is usable.
+//
+// It is here because those two are configuration mistakes rather than
+// token problems, and finding them at start-up — where the message can
+// name the field — is worth much more than finding them per request as
+// a stream of rejections that all look like a client's fault.
+//
+// ```novo
+// use jwtpolicy
+//
+// fn main() [io]
+//     match jwtpolicy.check(jwtpolicy.strict())
+//         Some(e) => println(e.message())       // strict() alone accepts nothing
+//         None    => println("usable")
+// ```
+pub fn check(p: JwtPolicy) -> ?JwtError
+    todo("jwt-nv.jwtpolicy.check")
