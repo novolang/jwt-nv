@@ -1,6 +1,6 @@
 [package]
 name        = "jwt-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "JSON Web Tokens with the unverified state unusable by construction: decoding hands back a token whose claims cannot be read until a signature check has produced a verified one, the `none` algorithm is unrepresentable, and validation is a policy value rather than a pile of optional arguments.  HS256, RS256 and ES256, over crypto-nv and p256-nv, with the current time supplied by the caller."
 license     = "Apache-2.0"
 
@@ -24,6 +24,7 @@ category    = "web"
 tags        = ["jwt", "jws", "hs256", "rs256", "es256", "auth", "token", "rfc-7519", "web"]
 repository  = "https://github.com/novolang/jwt-nv"
 maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -50,4 +51,4 @@ crypto-nv = "^0.1"
 # RS256 with more force: there is no RSA row in
 # planning/ORBIT-MUST-HAVE.md at all.  Both gaps are named in the
 # README's Status section rather than hidden behind a `todo()`.
-p256-nv = "^0.0.1"
+p256-nv = "^0.0.2"
