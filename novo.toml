@@ -1,6 +1,6 @@
 [package]
 name        = "jwt-nv"
-version     = "0.0.3"
+version     = "0.0.4"
 description = "JSON Web Tokens with the unverified state unusable by construction: decoding hands back a token whose claims cannot be read until a signature check has produced a verified one, the `none` algorithm is unrepresentable, and validation is a policy value rather than a pile of optional arguments.  HS256, RS256 and ES256, over crypto-nv and p256-nv, with the current time supplied by the caller."
 license     = "Apache-2.0"
 
