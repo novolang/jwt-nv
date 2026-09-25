@@ -5,6 +5,15 @@ All notable changes to jwt-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.5 — 2026-09-25
+
+The package builds with novo 0.11.  Every body is still `todo()`.
+
+- The lock file moves crypto-nv 0.1.1 to 0.1.6.  crypto-nv 0.1.1 writes
+  into lists through names that are not declared `var`, which novo 0.11
+  refuses (E2038), so this package did not build with novo 0.11 against
+  it.  No requirement in the manifest changed.
+
 ## 0.0.4 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
